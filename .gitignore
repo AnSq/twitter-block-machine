@@ -2,3 +2,6 @@ env/
 get_access_token.py
 consumer.json
 *.token.json
+*.sqlite
+*.pyc
+*.sql
