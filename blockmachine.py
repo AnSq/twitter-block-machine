@@ -9,6 +9,7 @@ import requests_oauthlib
 import sqlite3
 import urllib3
 import multiprocessing
+import traceback
 
 from pprint import pprint as pp
 
@@ -35,9 +36,9 @@ class DatabaseAccess (object):
                 twitter_id   TEXT    PRIMARY KEY,
                 at_name      TEXT    NOT NULL,
                 display_name TEXT    NOT NULL,
-                followers    INTEGER NOT NULL,
-                following    INTEGER NOT NULL,
                 tweets       INTEGER NOT NULL,
+                following    INTEGER NOT NULL,
+                followers    INTEGER NOT NULL,
                 verified     INTEGER NOT NULL,
                 protected    INTEGER NOT NULL,
                 created_at   TEXT    NOT NULL,
@@ -93,9 +94,9 @@ class DatabaseAccess (object):
             "twitter_id"   : str(user.id),
             "at_name"      : user.screen_name,
             "display_name" : user.name,
-            "followers"    : user.followers_count,
-            "following"    : user.friends_count,
             "tweets"       : user.statuses_count,
+            "following"    : user.friends_count,
+            "followers"    : user.followers_count,
             "verified"     : user.verified,
             "protected"    : user.protected,
             "created_at"   : created_at(user.created_at),
@@ -104,7 +105,7 @@ class DatabaseAccess (object):
 
         self.cur.execute("""
             UPDATE OR IGNORE users SET
-            at_name=:at_name, display_name=:display_name, followers=:followers, following=:following, tweets=:tweets, verified=:verified, protected=:protected, created_at=:created_at, bio=:bio
+            at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, verified=:verified, protected=:protected, created_at=:created_at, bio=:bio
             WHERE twitter_id=:twitter_id;
             """,
             data
@@ -112,8 +113,8 @@ class DatabaseAccess (object):
 
         self.cur.execute ("""
             INSERT OR IGNORE INTO users
-            (twitter_id, at_name, display_name, followers, following, tweets, verified, protected, created_at, bio)
-            VALUES (:twitter_id, :at_name, :display_name, :followers, :following, :tweets, :verified, :protected, :created_at, :bio);
+            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  verified,  protected,  created_at,  bio)
+            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :verified, :protected, :created_at, :bio);
             """,
             data
         )
@@ -130,7 +131,7 @@ class DatabaseAccess (object):
             "citation": citation
         }
         self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, active=1 WHERE user_id==:user_id AND cause==:cause;",    data)
-        self.cur.execute("INSERT OR IGNORE INTO user_causes (user_id, cause, citation) VALUES (:user_id, :cause, :citation)", data)
+        self.cur.execute("INSERT OR IGNORE INTO user_causes (user_id, cause, citation) VALUES (:user_id, :cause, :citation);", data)
 
 
     def get_user_ids_by_cause(self, cause_id):
@@ -142,7 +143,7 @@ class DatabaseAccess (object):
             if not chunk:
                 break
             for r in chunk:
-                yield r[0]
+                yield int(r[0])
 
 
     def deactivate_user_cause(self, twitter_id, cause_id):
@@ -160,6 +161,18 @@ class DatabaseAccess (object):
 
         rs = self.cur.execute("SELECT user_id FROM user_causes WHERE user_id==? AND cause==? AND active==1;", [str(twitter_id), cause_id])
         return bool(rs.fetchone())
+
+
+    def get_atname_by_id(self, twitter_id):
+        """gets the at_name associated with a Twitter ID"""
+
+        rs = self.cur.execute("SELECT at_name FROM users WHERE twitter_id==?;", [str(twitter_id)])
+
+        result = rs.fetchone()
+        if result:
+            return result[0]
+        else:
+            return None
 
 
 
@@ -212,6 +225,8 @@ class FollowerBlocker (object):
         followers = []
         results = []
 
+        start = time.time()
+
         print "Getting follower objects"
         try:
             for i,chunk in enumerate([follower_ids[i:i+100] for i in xrange(0, len(follower_ids), 100)]):
@@ -233,7 +248,7 @@ class FollowerBlocker (object):
                 print "???"
                 raise
 
-        print "get_followers() done"
+        print "\nget_followers() done in %f" % (time.time() - start)
 
         return (follower_ids, followers)
 
@@ -246,19 +261,26 @@ class FollowerBlocker (object):
         follower_ids = set(follower_ids)
         old_followers = self.db.get_user_ids_by_cause(self.cause_id)
 
+        blocks = 0
+        unblocks = 0
+
         # deactivate users that no longer follow the root user
         for uid in old_followers:
             if uid not in follower_ids:
                 self.db.deactivate_user_cause(uid, self.cause_id)
                 self.unblock(uid)
-                self.db.commit()
+                unblocks += 1
 
         for follower in followers:
             if not self.db.is_user_cause_active(follower.id, self.cause_id):
                 self.block(follower)
+                blocks += 1
             self.db.add_user(follower)
             self.db.add_user_cause(follower.id, self.cause_id)
-            self.db.commit()
+
+        self.db.commit()
+
+        print "%d blocks, %d unblocks" % (blocks, unblocks)
 
 
     def block(self, user):
@@ -268,7 +290,7 @@ class FollowerBlocker (object):
 
     def unblock(self, twitter_id):
         """Unblocks the user represented by the specified user ID"""
-        print "Unblock %d" % twitter_id
+        print "Unblock %s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
 
 
 
@@ -363,28 +385,36 @@ def limit_block(api, endpoint, i=-1):
 def get_followers_chunck(api, chunk, i):
     """Threadable function for looking up user objects. Used by FollowerBlocker.get_followers()"""
 
-    print i
+    sys.stdout.write("\r\x1b[K%d" % i)
+    sys.stdout.flush()
 
     while True:
         limit_block(api, "/users/lookup", i)
         try:
             return api.UsersLookup(user_id=chunk, include_entities=False)
         except twitter.error.TwitterError as e:
-            if e.message[0]["message"] == RLE: pass
-            else:
-                print e.message
-                raise
+            e_type, e_val, e_trace = sys.exc_info()
+            try:
+                if e.message[0]["message"] == RLE: pass
+                else:
+                    print e.message
+                    raise
+            except:
+                print "=== THREAD %4d ==========" % i
+                traceback.print_exc()
+                print "==========================="
+                raise e_type, e_val, e_trace
+
 
 
 def main():
-    db = DatabaseAccess()
+    db = DatabaseAccess("test.sqlite")
     api = login(sys.argv[1])
     print api.VerifyCredentials(skip_status=True)
     print
 
     fb = FollowerBlocker(api, db, "RichardBSpencer")
-    followers = fb.get_followers()
-    print len(followers[0]), len(followers[1])
+    fb.scan()
 
 
 if __name__ == "__main__":
