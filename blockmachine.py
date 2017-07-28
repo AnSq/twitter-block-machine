@@ -218,8 +218,13 @@ class FollowerBlocker (object):
     def get_followers(self):
         """Gets the followers of the object's root user"""
 
+        root_user = self.api.GetUser(screen_name=self.root_at_name, include_entities=False)
+        print "Getting %d followers of @%s" % (root_user.followers_count, root_user.screen_name)
+
         print "Getting follower IDs"
         follower_ids = self._get_follower_ids_ratelimited()
+
+        chunks = [follower_ids[i:i+100] for i in xrange(0, len(follower_ids), 100)]
 
         pool = multiprocessing.Pool(32)
         followers = []
@@ -229,8 +234,8 @@ class FollowerBlocker (object):
 
         print "Getting follower objects"
         try:
-            for i,chunk in enumerate([follower_ids[i:i+100] for i in xrange(0, len(follower_ids), 100)]):
-                results.append(pool.apply_async(get_followers_chunck, (self.api, chunk, i)))
+            for i,chunk in enumerate(chunks):
+                results.append(pool.apply_async(get_followers_chunck, (self.api, chunk, i, len(chunks))))
             pool.close()
             for r in results:
                 r.wait(999999999)
@@ -250,15 +255,15 @@ class FollowerBlocker (object):
 
         print "\nget_followers() done in %f" % (time.time() - start)
 
-        return (follower_ids, followers)
+        return followers
 
 
     def scan(self):
         """Does one pass of getting the root user's followers, updating the
         database, and blocking/unblocking as necessary"""
 
-        follower_ids, followers = self.get_followers()
-        follower_ids = set(follower_ids)
+        followers = self.get_followers()
+        follower_ids = set(u.id for u in followers)
         old_followers = self.db.get_user_ids_by_cause(self.cause_id)
 
         blocks = 0
@@ -290,7 +295,7 @@ class FollowerBlocker (object):
 
     def unblock(self, twitter_id):
         """Unblocks the user represented by the specified user ID"""
-        print "Unblock %s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
+        print "Unblock @%s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
 
 
 
@@ -382,10 +387,11 @@ def limit_block(api, endpoint, i=-1):
         print "Resuming"
 
 
-def get_followers_chunck(api, chunk, i):
+def get_followers_chunck(api, chunk, i, num_chunks):
     """Threadable function for looking up user objects. Used by FollowerBlocker.get_followers()"""
 
-    sys.stdout.write("\r\x1b[K%d" % i)
+    sys.stdout.write("\r\x1b[K") #carriage return and clear line
+    sys.stdout.write("chunk %d/%d - %.2f%%" % (i+1, num_chunks, float(i+1)*100/num_chunks))
     sys.stdout.flush()
 
     while True:
@@ -403,6 +409,10 @@ def get_followers_chunck(api, chunk, i):
                 print "=== THREAD %4d ==========" % i
                 traceback.print_exc()
                 print "==========================="
+
+                with open("error_logs/%s.log" % multiprocessing.current_process().name, "w") as f:
+                    traceback.print_exc(file=f)
+
                 raise e_type, e_val, e_trace
 
 
