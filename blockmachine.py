@@ -326,9 +326,10 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
         access_token        = user_token["access_token"]
         access_token_secret = user_token["access_token_secret"]
     else:
-        oauth = requests_oauthlib.OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri='oob')
+        oauth = requests_oauthlib.OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri="oob")
 
         req_token = oauth.fetch_request_token("https://api.twitter.com/oauth/request_token")
+        oat = req_token.get("oauth_token")
         auth_url  = oauth.authorization_url("https://api.twitter.com/oauth/authorize")
 
         print "\nGo to this URL to get a PIN code (make sure you're logged in as @%s):" % username
@@ -336,13 +337,12 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 
         pin = raw_input("Enter your PIN: ")
 
-        oauth = requests_oauthlib.OAuth1Session(
-            consumer_key,
-            client_secret=consumer_secret,
-            resource_owner_key=req_token.get('oauth_token'),
-            resource_owner_secret=req_token.get('oauth_token_secret'),
-            verifier=pin
-        )
+        # Doing a normal pin verifier for fetch_access_token results in us
+        # getting a read-only token. I don't know why. Anyhow,
+        # parse_authorization_response (like you would do with a callback URL)
+        # seems to work, so here we're building a fake callback URL with the pin
+        # as the verifier. This gives us a read-write token like we want.
+        oauth.parse_authorization_response("?oauth_token=%s&oauth_verifier=%s" % (oat, pin))
 
         acc_token = oauth.fetch_access_token("https://api.twitter.com/oauth/access_token")
 
