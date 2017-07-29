@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import time
+import math
 import twitter
 import requests_oauthlib
 import sqlite3
@@ -190,8 +191,10 @@ class FollowerBlocker (object):
         self.cause_id = self.db.get_cause("follows", self.root_at_name)
 
 
-    def _get_follower_ids_ratelimited(self):
+    def _get_follower_ids_ratelimited(self, user):
         """Handles ratelimiting when getting follower IDs"""
+
+        num_pages = int(math.ceil(float(user.followers_count)/5000))
 
         cursor = -1
         results = []
@@ -199,6 +202,10 @@ class FollowerBlocker (object):
         i = 0
         while True:
             limit_block(self.api, "/followers/ids", i)
+
+            cr()
+            sys.stdout.write("page %d/%d" % (i+1, num_pages))
+            sys.stdout.flush()
 
             try:
                 cursor, prev_cursor, chunk = self.api.GetFollowerIDsPaged(screen_name=self.root_at_name, cursor=cursor)
@@ -222,7 +229,7 @@ class FollowerBlocker (object):
         print "Getting %d followers of @%s" % (root_user.followers_count, root_user.screen_name)
 
         print "Getting follower IDs"
-        follower_ids = self._get_follower_ids_ratelimited()
+        follower_ids = self._get_follower_ids_ratelimited(root_user)
 
         chunks = [follower_ids[i:i+100] for i in xrange(0, len(follower_ids), 100)]
 
@@ -232,7 +239,7 @@ class FollowerBlocker (object):
 
         start = time.time()
 
-        print "Getting follower objects"
+        print "\nGetting follower objects"
         try:
             for i,chunk in enumerate(chunks):
                 results.append(pool.apply_async(get_followers_chunck, (self.api, chunk, i, len(chunks))))
@@ -390,7 +397,7 @@ def limit_block(api, endpoint, i=-1):
 def get_followers_chunck(api, chunk, i, num_chunks):
     """Threadable function for looking up user objects. Used by FollowerBlocker.get_followers()"""
 
-    sys.stdout.write("\r\x1b[K") #carriage return and clear line
+    cr()
     sys.stdout.write("chunk %d/%d - %.2f%%" % (i+1, num_chunks, float(i+1)*100/num_chunks))
     sys.stdout.flush()
 
@@ -415,6 +422,10 @@ def get_followers_chunck(api, chunk, i, num_chunks):
 
                 raise e_type, e_val, e_trace
 
+
+
+def cr():
+    sys.stdout.write("\r\x1b[K") #carriage return and clear line
 
 
 def main():
