@@ -5,3 +5,5 @@ consumer.json
 *.sqlite
 *.pyc
 *.sql
+whitelist.txt
+error_logs/

@@ -62,6 +62,16 @@ class DatabaseAccess (object):
                 removed_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (user_id, cause) ON CONFLICT IGNORE
             );
+
+            CREATE TABLE IF NOT EXISTS whitelist (
+                user_id TEXT PRIMARY KEY
+            );
+
+            CREATE VIEW IF NOT EXISTS removed_users AS
+            SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count
+            FROM users JOIN user_causes ON users.twitter_id==user_causes.user_id
+            WHERE removed_count > 0
+            ORDER BY added_count DESC, active DESC, removed_count DESC
         """)
         self.commit()
 
@@ -78,12 +88,20 @@ class DatabaseAccess (object):
 
     def add_cause(self, cause_type, reason):
         """Adds a cause to the list of available causes. Does nothing if it already exists"""
-        self.cur.execute("INSERT OR IGNORE INTO causes (cause_type, reason) VALUES (?,?);", [cause_type, reason])
+        try:
+            self.cur.execute("INSERT OR FAIL INTO causes (cause_type, reason) VALUES (?,?);", [cause_type, reason])
+        except sqlite3.IntegrityError as e:
+            pass
+
+
+    def add_whitelist(self, user_id):
+        """Adds a user to the whitelist. DOES NOT unblock them. Blockers are responsible for processing the whitelist."""
+        self.cur.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?);", [user_id])
 
 
     def get_cause(self, cause_type, reason):
         """Gets the ID of the given cause"""
-        rs = self.cur.execute("SELECT id FROM causes WHERE cause_type == ? AND reason == ?", [cause_type, reason])
+        rs = self.cur.execute("SELECT id FROM causes WHERE cause_type==? AND reason==?", [cause_type, reason])
         row = rs.fetchone()
         return row[0] if row else None
 
@@ -125,19 +143,21 @@ class DatabaseAccess (object):
         """Adds a user-cause relationship to the database.
         Activates the relationship if it already exists.
         Does nothing if it's already active."""
-
         data = {
             "user_id":  str(user_id),
             "cause":    cause_id,
             "citation": citation
         }
-        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, active=1 WHERE user_id==:user_id AND cause==:cause;",    data)
-        self.cur.execute("INSERT OR IGNORE INTO user_causes (user_id, cause, citation) VALUES (:user_id, :cause, :citation);", data)
+        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, active=1 WHERE user_id==:user_id AND cause==:cause;", data)
+
+        try:
+            self.cur.execute("INSERT OR FAIL INTO user_causes (user_id, cause, citation) VALUES (:user_id, :cause, :citation);", data)
+        except sqlite3.IntegrityError as e:
+            pass
 
 
     def get_user_ids_by_cause(self, cause_id):
         """Gets all user IDs that are active with the given cause. (Returns a generator)"""
-
         rs = self.cur.execute("SELECT user_id FROM user_causes WHERE cause==? AND active==?;", [cause_id, 1])
         while True:
             chunk = rs.fetchmany(256)
@@ -153,22 +173,24 @@ class DatabaseAccess (object):
         matched a cause but don't anymore. For example, if they unfollowed the
         root user of a "follows" type cause. User-cause relationships can be
         reactivated if, for example, a user re-follows someone.)"""
-
         self.cur.execute("UPDATE user_causes SET active=0, removed_count=removed_count+1 WHERE user_id==? AND cause==?;", [str(twitter_id), cause_id])
+
+
+    def whitelist_user_cause(self, twitter_id, cause_id):
+        """Deactivates a user-cause relationship due to whitelisting.
+        Does not increment removed_count."""
+        self.cur.execute("UPDATE user_causes SET active=0 WHERE user_id==? AND cause==?;", [str(twitter_id), cause_id])
 
 
     def is_user_cause_active(self, twitter_id, cause_id):
         """Checks if a user-cause relationship is active"""
-
         rs = self.cur.execute("SELECT user_id FROM user_causes WHERE user_id==? AND cause==? AND active==1;", [str(twitter_id), cause_id])
         return bool(rs.fetchone())
 
 
     def get_atname_by_id(self, twitter_id):
         """gets the at_name associated with a Twitter ID"""
-
         rs = self.cur.execute("SELECT at_name FROM users WHERE twitter_id==?;", [str(twitter_id)])
-
         result = rs.fetchone()
         if result:
             return result[0]
@@ -176,19 +198,95 @@ class DatabaseAccess (object):
             return None
 
 
+    def get_active_whitelisted(self, cause_id):
+        """Get user IDs that are active with the given cause and whitelisted."""
+        rs = self.cur.execute("""
+            SELECT twitter_id FROM users JOIN user_causes ON twitter_id==user_id
+            WHERE cause==? AND active==1 AND twitter_id IN whitelist;
+            """,
+            [cause_id]
+        )
+        return [int(x[0]) for x in rs.fetchall()]
 
-class FollowerBlocker (object):
-    """Blocks the followers of one specific user (called the root user)"""
 
-    def __init__(self, api, db, root_at_name):
-        """Initialize the object with root_at_name as the root user's twitter handle"""
+    def get_whitelist(self):
+        """return the entire whitelist as a list"""
+        rs = self.cur.execute("SELECT user_id FROM whitelist;")
+        return [int(x[0]) for x in rs.fetchall()]
+
+
+
+
+class Blocker (object):
+    """Base object for blockers"""
+
+    def __init__(self, api, db, live=False):
         self.api = api
         self.db = db
+        self.live = live
+
+
+    def load_whitelist(self, fname="whitelist.txt"):
+        """Loads the whitelist into the database.
+        (DOES NOT unblock users. Use process_whitelist() for that.)"""
+
+        print "Loading whitelist"
+
+        names = []
+        with open(fname) as f:
+            for line in f:
+                names.append(line.strip())
+
+        chunks = chunkify(names, 100)
+        users = []
+        for i,chunk in enumerate(chunks):
+            users += lookup_users_chunk(self.api, i, len(chunks), at_names=chunk)
+        print
+
+        for u in users:
+            self.db.add_whitelist(u.id)
+        self.db.commit()
+
+
+    def process_whitelist(self, cause_id):
+        """Unblocks users in the whitelist"""
+        active = self.db.get_active_whitelisted(cause_id)
+        for uid in active:
+            self.db.whitelist_user_cause(uid, cause_id)
+            self.unblock(uid)
+        self.db.commit()
+
+
+    def block(self, user):
+        """Blocks the user represented by the specified user object"""
+        print "Block @%s" % user.screen_name
+
+        if self.live:
+            pass #TODO: do actual block
+
+
+    def unblock(self, twitter_id):
+        """Unblocks the user represented by the specified user ID"""
+        print "Unblock @%s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
+
+        if self.live:
+            pass #TODO: do actual unblock
+
+
+
+class FollowerBlocker (Blocker):
+    """Blocks the followers of one specific user (called the root user)"""
+
+    def __init__(self, api, db, root_at_name, live=False):
+        """Initialize the object with root_at_name as the root user's twitter handle"""
+        super(FollowerBlocker, self).__init__(api, db, live)
         self.root_at_name = root_at_name
 
         self.db.add_cause("follows", self.root_at_name)
         self.db.commit()
         self.cause_id = self.db.get_cause("follows", self.root_at_name)
+
+        self.process_whitelist(self.cause_id)
 
 
     def _get_follower_ids_ratelimited(self, user):
@@ -231,7 +329,7 @@ class FollowerBlocker (object):
         print "Getting follower IDs"
         follower_ids = self._get_follower_ids_ratelimited(root_user)
 
-        chunks = [follower_ids[i:i+100] for i in xrange(0, len(follower_ids), 100)]
+        chunks = chunkify(follower_ids, 100)
 
         pool = multiprocessing.Pool(32)
         followers = []
@@ -242,7 +340,9 @@ class FollowerBlocker (object):
         print "\nGetting follower objects"
         try:
             for i,chunk in enumerate(chunks):
-                results.append(pool.apply_async(get_followers_chunck, (self.api, chunk, i, len(chunks))))
+                args = [self.api, i, len(chunks)]
+                kwargs = {"user_ids": chunk}
+                results.append(pool.apply_async(lookup_users_chunk, args, kwargs))
             pool.close()
             for r in results:
                 r.wait(999999999)
@@ -257,7 +357,7 @@ class FollowerBlocker (object):
             try:
                 followers += r.get()
             except:
-                print "???"
+                print "\n???"
                 raise
 
         print "\nget_followers() done in %f" % (time.time() - start)
@@ -273,6 +373,8 @@ class FollowerBlocker (object):
         follower_ids = set(u.id for u in followers)
         old_followers = self.db.get_user_ids_by_cause(self.cause_id)
 
+        whitelist = set(self.db.get_whitelist())
+
         blocks = 0
         unblocks = 0
 
@@ -283,26 +385,23 @@ class FollowerBlocker (object):
                 self.unblock(uid)
                 unblocks += 1
 
+        # add and update users that do follow the root user
         for follower in followers:
-            if not self.db.is_user_cause_active(follower.id, self.cause_id):
+            whitelisted = follower.id in whitelist
+
+            if not whitelisted and not self.db.is_user_cause_active(follower.id, self.cause_id): #only block if not whitelisted
                 self.block(follower)
                 blocks += 1
-            self.db.add_user(follower)
-            self.db.add_user_cause(follower.id, self.cause_id)
+
+            self.db.add_user(follower) #add user regardless of whitelist status
+
+            self.db.add_user_cause(follower.id, self.cause_id) #add cause regardless of whitelist...
+            if whitelisted:
+                self.db.whitelist_user_cause(follower.id, self.cause_id) #...but don't activate it if whitelisted
 
         self.db.commit()
 
         print "%d blocks, %d unblocks" % (blocks, unblocks)
-
-
-    def block(self, user):
-        """Blocks the user represented by the specified user object"""
-        print "Block @%s" % user.screen_name
-
-
-    def unblock(self, twitter_id):
-        """Unblocks the user represented by the specified user ID"""
-        print "Unblock @%s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
 
 
 
@@ -381,6 +480,11 @@ def created_at(created_at):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(created_at, "%a %b %d %H:%M:%S +0000 %Y"))
 
 
+def chunkify(a, size):
+    """Splits `a` into chunks of size `size`"""
+    return [a[i:i+size] for i in xrange(0, len(a), size)]
+
+
 def limit_block(api, endpoint, i=-1):
     """Attempts to stop us from exceeding our API rate limit for the given endpoint.
     The API object doesn't always have complete information on our remaining
@@ -389,12 +493,12 @@ def limit_block(api, endpoint, i=-1):
     limit = api.rate_limit.get_limit(endpoint)
     if limit.remaining == 0:
         sleep_for = limit.reset - time.time() + 5
-        print "[i=%d] Rate limit reached for %s. Sleeping for %.0f seconds (%.1f minutes. Until %s)" % (i, endpoint, sleep_for, sleep_for/60, time.strftime("%H:%M:%S %p", time.localtime(limit.reset+5)))
+        print "\n[i=%d] Rate limit reached for %s. Sleeping for %.0f seconds (%.1f minutes. Until %s)" % (i, endpoint, sleep_for, sleep_for/60, time.strftime("%H:%M:%S", time.localtime(limit.reset+5)))
         time.sleep(sleep_for)
         print "Resuming"
 
 
-def get_followers_chunck(api, chunk, i, num_chunks):
+def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
     """Threadable function for looking up user objects. Used by FollowerBlocker.get_followers()"""
 
     cr()
@@ -404,7 +508,7 @@ def get_followers_chunck(api, chunk, i, num_chunks):
     while True:
         limit_block(api, "/users/lookup", i)
         try:
-            return api.UsersLookup(user_id=chunk, include_entities=False)
+            return api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)
         except twitter.error.TwitterError as e:
             e_type, e_val, e_trace = sys.exc_info()
             try:
@@ -413,12 +517,13 @@ def get_followers_chunck(api, chunk, i, num_chunks):
                     print e.message
                     raise
             except:
-                print "=== THREAD %4d ==========" % i
-                traceback.print_exc()
+                threadname = multiprocessing.current_process().name
+                print "\n=== %s i=%d ==========" % (threadname, i)
+                traceback.print_exception(e_type, e_val, e_trace)
                 print "==========================="
 
-                with open("error_logs/%s.log" % multiprocessing.current_process().name, "w") as f:
-                    traceback.print_exc(file=f)
+                with open("error_logs/%s.log" % threadname, "w") as f:
+                    traceback.print_exception(e_type, e_val, e_trace, file=f)
 
                 raise e_type, e_val, e_trace
 
@@ -430,11 +535,12 @@ def cr():
 
 def main():
     db = DatabaseAccess("test.sqlite")
-    api = login(sys.argv[1])
+    api = login("BlockMachine_RS")
     print api.VerifyCredentials(skip_status=True)
     print
 
-    fb = FollowerBlocker(api, db, "RichardBSpencer")
+    fb = FollowerBlocker(api, db, "RichardBSpencer", False)
+    fb.load_whitelist()
     fb.scan()
 
 
