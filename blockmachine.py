@@ -40,6 +40,19 @@ class DatabaseAccess (object):
         self.commit()
 
 
+    @staticmethod
+    def _replace_url_entities(user, attr):
+        """replaces Twitter URL entities in the given attribute of the given user and returns the result"""
+        s = user.__getattribute__(attr)
+        try:
+            for en in user._json["entities"][attr]["urls"]:
+                s = s.replace(en["url"], en["expanded_url"])
+        except KeyError as e:
+            pass
+        finally:
+            return s.replace("http://", "").replace("https://", "") if s else s
+
+
     def commit(self):
         """Commits pending changes to the database"""
         self.conn.commit()
@@ -80,16 +93,21 @@ class DatabaseAccess (object):
             "tweets"       : user.statuses_count,
             "following"    : user.friends_count,
             "followers"    : user.followers_count,
+            "likes"        : user.favourites_count,
             "verified"     : user.verified,
             "protected"    : user.protected,
+            "egg"          : not user.default_profile_image,
             "created_at"   : created_at(user.created_at),
-            "bio"          : user.description,
+            "lang"         : user.lang,
+            "bio"          : self._replace_url_entities(user, "description"),
+            "location"     : user.location,
+            "url"          : self._replace_url_entities(user, "url"),
             "deleted"      : 0
         }
 
         self.cur.execute("""
             UPDATE OR IGNORE users SET
-            at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, verified=:verified, protected=:protected, created_at=:created_at, bio=:bio, deleted=:deleted
+            at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, likes=:likes, verified=:verified, protected=:protected, egg=:egg, created_at=:created_at, lang=:lang, bio=:bio, location=:location, url=:url, deleted=:deleted
             WHERE twitter_id=:twitter_id;
             """,
             data
@@ -97,8 +115,8 @@ class DatabaseAccess (object):
 
         self.cur.execute ("""
             INSERT OR IGNORE INTO users
-            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  verified,  protected,  created_at,  bio,  deleted)
-            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :verified, :protected, :created_at, :bio, :deleted);
+            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  egg,  created_at,  lang,  bio,  location,  url,  deleted)
+            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :egg, :created_at, :lang, :bio, :location, :url,  :deleted);
             """,
             data
         )
@@ -538,7 +556,6 @@ def main():
 
     fb = FollowerBlocker(api, db, "RichardBSpencer", True)
     fb.load_whitelist()
-    fb.process_whitelist()
     fb.scan()
 
 

@@ -5,10 +5,15 @@ CREATE TABLE IF NOT EXISTS users (
     tweets       INTEGER NOT NULL,
     following    INTEGER NOT NULL,
     followers    INTEGER NOT NULL,
+    likes        INTEGER NOT NULL,
     verified     INTEGER NOT NULL,
     protected    INTEGER NOT NULL,
+    egg          INTEGER NOT NULL,
     created_at   TEXT    NOT NULL,
-    bio          TEXT    DEFAULT '',
+    lang         TEXT    NOT NULL,
+    bio          TEXT    NOT NULL,
+    location     TEXT    NOT NULL,
+    url          TEXT    NOT NULL,
     deleted      INTEGER NOT NULL DEFAULT 0
 );
 
