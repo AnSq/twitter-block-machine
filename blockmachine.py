@@ -17,6 +17,8 @@ from pprint import pprint as pp
 
 CONSUMER_FILE = "consumer.json"
 RLE = "Rate limit exceeded"
+DELETED = 1
+SUSPENDED = 2
 
 
 urllib3.disable_warnings()
@@ -32,47 +34,9 @@ class DatabaseAccess (object):
         self.conn = sqlite3.connect(fname)
         self.cur = self.conn.cursor()
 
-        self.cur.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                twitter_id   TEXT    PRIMARY KEY,
-                at_name      TEXT    NOT NULL,
-                display_name TEXT    NOT NULL,
-                tweets       INTEGER NOT NULL,
-                following    INTEGER NOT NULL,
-                followers    INTEGER NOT NULL,
-                verified     INTEGER NOT NULL,
-                protected    INTEGER NOT NULL,
-                created_at   TEXT    NOT NULL,
-                bio          TEXT    DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS causes (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                cause_type TEXT    NOT NULL,
-                reason     TEXT    NOT NULL,
-                UNIQUE (cause_type, reason) ON CONFLICT IGNORE
-            );
-
-            CREATE TABLE IF NOT EXISTS user_causes (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id       TEXT    REFERENCES users(twitter_id),
-                cause         INTEGER REFERENCES causes(id),
-                citation      TEXT             DEFAULT NULL,
-                active        INTEGER NOT NULL DEFAULT 1,
-                removed_count INTEGER NOT NULL DEFAULT 0,
-                UNIQUE (user_id, cause) ON CONFLICT IGNORE
-            );
-
-            CREATE TABLE IF NOT EXISTS whitelist (
-                user_id TEXT PRIMARY KEY
-            );
-
-            CREATE VIEW IF NOT EXISTS removed_users AS
-            SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count
-            FROM users JOIN user_causes ON users.twitter_id==user_causes.user_id
-            WHERE removed_count > 0
-            ORDER BY added_count DESC, active DESC, removed_count DESC
-        """)
+        with open("schema.sql") as f:
+            self.cur.executescript(f.read())
+        self.cur.execute("INSERT OR IGNORE INTO deleted_types (id, name) VALUES (?, 'deleted'), (?, 'suspended');", [DELETED, SUSPENDED])
         self.commit()
 
 
@@ -119,12 +83,13 @@ class DatabaseAccess (object):
             "verified"     : user.verified,
             "protected"    : user.protected,
             "created_at"   : created_at(user.created_at),
-            "bio"          : user.description
+            "bio"          : user.description,
+            "deleted"      : 0
         }
 
         self.cur.execute("""
             UPDATE OR IGNORE users SET
-            at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, verified=:verified, protected=:protected, created_at=:created_at, bio=:bio
+            at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, verified=:verified, protected=:protected, created_at=:created_at, bio=:bio, deleted=:deleted
             WHERE twitter_id=:twitter_id;
             """,
             data
@@ -132,8 +97,8 @@ class DatabaseAccess (object):
 
         self.cur.execute ("""
             INSERT OR IGNORE INTO users
-            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  verified,  protected,  created_at,  bio)
-            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :verified, :protected, :created_at, :bio);
+            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  verified,  protected,  created_at,  bio,  deleted)
+            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :verified, :protected, :created_at, :bio, :deleted);
             """,
             data
         )
@@ -215,6 +180,10 @@ class DatabaseAccess (object):
         return [int(x[0]) for x in rs.fetchall()]
 
 
+    def set_user_deleted(self, twitter_id, deleted_status):
+        """marks the given user as deleted or suspended"""
+        self.cur.execute("UPDATE users SET deleted=? WHERE twitter_id==?;", [deleted_status, str(twitter_id)])
+
 
 
 class Blocker (object):
@@ -247,6 +216,8 @@ class Blocker (object):
             self.db.add_whitelist(u.id)
         self.db.commit()
 
+        print
+
 
     def process_whitelist(self, cause_id):
         """Unblocks users in the whitelist"""
@@ -262,15 +233,41 @@ class Blocker (object):
         print "Block @%s" % user.screen_name
 
         if self.live:
-            pass #TODO: do actual block
+            pass
+            #self.api.CreateBlock(user_id=user.id, include_entities=False, skip_status=True)
 
 
     def unblock(self, twitter_id):
         """Unblocks the user represented by the specified user ID"""
-        print "Unblock @%s (%d)" % (self.db.get_atname_by_id(twitter_id), twitter_id)
+        uname = self.db.get_atname_by_id(twitter_id)
+        print "Unblock @%s (%d)" % (uname, twitter_id)
 
         if self.live:
-            pass #TODO: do actual unblock
+            try:
+                self.api.DestroyBlock(user_id=twitter_id, include_entities=False, skip_status=True)
+            except twitter.error.TwitterError as e:
+                e_type, e_val, e_tb = sys.exc_info()
+                if error_message(e, "Sorry, that page does not exist."): #this probably means the user is suspended or deleted
+                    try:
+                        user = self.api.GetUser(user_id=twitter_id, include_entities=False) #if the user is suspended, this will throw an error
+                        raise Exception("DestroyBlock threw \"page does not exist\" but GetUser didn't throw aything (for @%s)" % user.screen_name)
+
+                    except twitter.error.TwitterError as e2:
+                        if error_message(e2, "User has been suspended."):
+                            print "\t@%s is suspended" % uname
+                            self.db.set_user_deleted(twitter_id, SUSPENDED)
+                            self.db.commit()
+
+                        elif error_message(e2, "User not found."):
+                            print "\t@%s is deleted" % uname
+                            self.db.set_user_deleted(twitter_id, DELETED)
+                            self.db.commit()
+
+                        else:
+                            traceback.print_exception(e_type, e_val, e_tb)
+                            raise e2
+                else:
+                    raise
 
 
 
@@ -308,7 +305,7 @@ class FollowerBlocker (Blocker):
             try:
                 cursor, prev_cursor, chunk = self.api.GetFollowerIDsPaged(screen_name=self.root_at_name, cursor=cursor)
             except twitter.error.TwitterError as e:
-                if e.message[0]["message"] == RLE: pass
+                if error_message(e, RLE): continue
                 else: raise
             results += chunk
 
@@ -360,7 +357,7 @@ class FollowerBlocker (Blocker):
                 print "\n???"
                 raise
 
-        print "\nget_followers() done in %f" % (time.time() - start)
+        print "\nFollower objects gotten in %.2f seconds\n" % (time.time() - start)
 
         return followers
 
@@ -401,7 +398,7 @@ class FollowerBlocker (Blocker):
 
         self.db.commit()
 
-        print "%d blocks, %d unblocks" % (blocks, unblocks)
+        print "%d blocks, %d unblocks\n" % (blocks, unblocks)
 
 
 
@@ -510,27 +507,27 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
         try:
             return api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)
         except twitter.error.TwitterError as e:
-            e_type, e_val, e_trace = sys.exc_info()
-            try:
-                if e.message[0]["message"] == RLE: pass
-                else:
-                    print e.message
-                    raise
-            except:
+            if error_message(e, RLE):
+                continue
+            else:
                 threadname = multiprocessing.current_process().name
                 print "\n=== %s i=%d ==========" % (threadname, i)
-                traceback.print_exception(e_type, e_val, e_trace)
+                traceback.print_exc()
+                print e.message
                 print "==========================="
 
                 with open("error_logs/%s.log" % threadname, "w") as f:
-                    traceback.print_exception(e_type, e_val, e_trace, file=f)
+                    traceback.print_exc(file=f)
 
-                raise e_type, e_val, e_trace
-
+                raise
 
 
 def cr():
     sys.stdout.write("\r\x1b[K") #carriage return and clear line
+
+
+def error_message(e, msg):
+    return type(e.message) == list and type(e.message[0]) == dict and e.message[0]["message"] == msg
 
 
 def main():
@@ -539,8 +536,9 @@ def main():
     print api.VerifyCredentials(skip_status=True)
     print
 
-    fb = FollowerBlocker(api, db, "RichardBSpencer", False)
+    fb = FollowerBlocker(api, db, "RichardBSpencer", True)
     fb.load_whitelist()
+    fb.process_whitelist()
     fb.scan()
 
 
