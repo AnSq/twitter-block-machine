@@ -1,3 +1,5 @@
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS users (
     twitter_id   TEXT    PRIMARY KEY,
     at_name      TEXT    NOT NULL,
@@ -6,14 +8,16 @@ CREATE TABLE IF NOT EXISTS users (
     following    INTEGER NOT NULL,
     followers    INTEGER NOT NULL,
     likes        INTEGER NOT NULL,
-    verified     INTEGER NOT NULL,
-    protected    INTEGER NOT NULL,
-    egg          INTEGER NOT NULL,
+    verified     BOOLEAN NOT NULL,
+    protected    BOOLEAN NOT NULL,
+    bio          TEXT,
+    location     TEXT,
+    url          TEXT,
+    egg          BOOLEAN NOT NULL,
     created_at   TEXT    NOT NULL,
-    lang         TEXT    NOT NULL,
-    bio          TEXT    NOT NULL,
-    location     TEXT    NOT NULL,
-    url          TEXT    NOT NULL,
+    lang         TEXT,
+    time_zone    TEXT,
+    utc_offset   INTEGER,
     deleted      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -29,7 +33,7 @@ CREATE TABLE IF NOT EXISTS user_causes (
     user_id       TEXT    REFERENCES users(twitter_id),
     cause         INTEGER REFERENCES causes(id),
     citation      TEXT             DEFAULT NULL,
-    active        INTEGER NOT NULL DEFAULT 1,
+    active        BOOLEAN NOT NULL DEFAULT 1,
     removed_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (user_id, cause) ON CONFLICT IGNORE
 );
