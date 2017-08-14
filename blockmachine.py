@@ -30,6 +30,7 @@ class DatabaseAccess (object):
 
     def __init__(self, fname="database.sqlite"):
         """Connect to the database, creating it if needed"""
+        self.original_process = (multiprocessing.current_process().name, multiprocessing.current_process().ident)
 
         self.fname = fname
         self.conn = sqlite3.connect(self.fname)
@@ -37,7 +38,6 @@ class DatabaseAccess (object):
 
         with open("schema.sql") as f:
             self.cur.executescript(f.read())
-        self.cur.execute("PRAGMA foreign_keys = ON;")
         self.cur.execute("INSERT OR IGNORE INTO deleted_types (id, name) VALUES (?, 'deleted'), (?, 'suspended');", [DELETED, SUSPENDED])
         self.commit()
 
@@ -59,6 +59,11 @@ class DatabaseAccess (object):
             return s.replace("http://", "").replace("https://", "") if s else s
 
 
+    def in_original_process(self):
+        """Return whether this function is called from the same process that created the object"""
+        return (multiprocessing.current_process().name, multiprocessing.current_process().ident) == self.original_process
+
+
     def commit(self):
         """Commit pending changes to the database"""
         self.conn.commit()
@@ -77,9 +82,14 @@ class DatabaseAccess (object):
             pass
 
 
-    def add_whitelist(self, user_id):
+    def add_whitelist(self, user_id, at_name):
         """Add a user to the whitelist. DOES NOT unblock them. Blockers are responsible for processing the whitelist."""
-        self.cur.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?);", [user_id])
+        self.cur.execute("INSERT OR IGNORE INTO whitelist (user_id, at_name) VALUES (?, ?);", [user_id, at_name])
+
+
+    def clear_whitelist(self):
+        """Clear the whitelist"""
+        self.cur.execute("DELETE FROM whitelist;")
 
 
     def get_cause(self, cause_type, reason):
@@ -193,7 +203,7 @@ class DatabaseAccess (object):
         """Get user IDs that are active with the given cause and whitelisted."""
         rs = self.cur.execute("""
             SELECT twitter_id FROM users JOIN user_causes ON twitter_id==user_id
-            WHERE cause==? AND active==1 AND twitter_id IN whitelist;
+            WHERE cause==? AND active==1 AND twitter_id IN (SELECT user_id FROM whitelist);
             """,
             [cause_id]
         )
@@ -252,6 +262,7 @@ class Blocker (object):
             if cursor == 0:
                 break
 
+        print
         return results
 
 
@@ -293,18 +304,20 @@ class Blocker (object):
             users += lookup_users_chunk(self.api, i, len(chunks), at_names=chunk)
         print
 
+        self.db.clear_whitelist()
+
         for u in users:
-            self.db.add_whitelist(u.id)
+            self.db.add_whitelist(u.id, u.screen_name)
         self.db.commit()
 
         print
 
 
-    def process_whitelist(self, cause_id):
+    def process_whitelist(self):
         """Unblock users in the whitelist"""
-        active = self.db.get_active_whitelisted(cause_id)
+        active = self.db.get_active_whitelisted(self.cause_id)
         for uid in active:
-            self.db.whitelist_user_cause(uid, cause_id)
+            self.db.whitelist_user_cause(uid, self.cause_id)
             self.unblock(uid)
         self.db.commit()
 
@@ -338,45 +351,100 @@ class Blocker (object):
         print "Unblocking of %d users completed in %.2f seconds" % (len(blocklist), time.time() - start)
 
 
-    def block(self, user):
-        """Block the user represented by the specified user object"""
-        print "Block @%s (%d)" % (user.screen_name, user.id)
+    def sync_blocklist(self):
+        """Make sure that the actual blocklist matches the database, blocking and unblocking as needed."""
+        print "Syncing blocklist..."
 
-        if self.live:
-            self.api.CreateBlock(user_id=user.id, include_entities=False, skip_status=True)
+        database_list = set(self.db.get_user_ids_by_cause(self.cause_id))
+        twitter_list  = set(self.get_blocklist())
+
+        to_unblock = twitter_list  - database_list
+        to_block   = database_list - twitter_list
+
+        print "Unblocking %d users..." % len(to_unblock)
+        for i,twitter_id in enumerate(to_unblock):
+            write_percentage(i, len(to_unblock))
+            self.unblock(twitter_id)
+
+        self._do_block(to_block)
+
+        self.db.commit()
+
+        print "Sync finished: %d blocks, %d unblocks" % (len(to_block), len(to_unblock))
+
+
+    def block(self, user):
+        """Block the user represented by the specified user object, Twitter ID, or [at_name, twitter_id] list or tuple"""
+        if type(user) is int:
+            twitter_id = user
+            if not self.db.in_original_process():
+                self.db = DatabaseAccess(self.db.fname)
+            at_name = self.db.get_atname_by_id(twitter_id) or "???"
+        elif type(user) is list or type(user) is tuple:
+            at_name = user[0]
+            twitter_id = user[1]
+        else:
+            at_name = user.screen_name
+            twitter_id = user.id
+
+        print "Block @%s (%d)" % (at_name, twitter_id)
+
+        try:
+            if self.live:
+                self.api.CreateBlock(user_id=twitter_id, include_entities=False, skip_status=True)
+            else:
+                user = self.api.GetUser(user_id=twitter_id, include_entities=False)
+        except twitter.error.TwitterError as e:
+            self._handle_deleted(at_name, twitter_id, e)
 
 
     def unblock(self, twitter_id):
         """Unblock the user represented by the specified user ID"""
-        uname = self.db.get_atname_by_id(twitter_id)
-        print "Unblock @%s (%d)" % (uname, twitter_id)
+        at_name = self.db.get_atname_by_id(twitter_id)
+        print "Unblock @%s (%d)" % (at_name, twitter_id)
 
         if self.live:
             try:
                 self.api.DestroyBlock(user_id=twitter_id, include_entities=False, skip_status=True)
             except twitter.error.TwitterError as e:
-                e_type, e_val, e_tb = sys.exc_info()
+                outer_exception_info = sys.exc_info()
                 if error_message(e, "Sorry, that page does not exist."): #this probably means the user is suspended or deleted
                     try:
                         user = self.api.GetUser(user_id=twitter_id, include_entities=False) #if the user is suspended, this will throw an error
                         raise Exception("DestroyBlock threw \"page does not exist\" but GetUser didn't throw aything (for @%s)" % user.screen_name)
-
-                    except twitter.error.TwitterError as e2:
-                        if error_message(e2, "User has been suspended."):
-                            print "\t@%s is suspended" % uname
-                            self.db.set_user_deleted(twitter_id, SUSPENDED)
-                            self.db.commit()
-
-                        elif error_message(e2, "User not found."):
-                            print "\t@%s is deleted" % uname
-                            self.db.set_user_deleted(twitter_id, DELETED)
-                            self.db.commit()
-
-                        else:
-                            traceback.print_exception(e_type, e_val, e_tb)
-                            raise e2
+                    except twitter.error.TwitterError as inner_exception:
+                        self._handle_deleted(at_name, twitter_id, inner_exception, outer_exception_info)
                 else:
                     raise
+        else:
+            try:
+                self.api.GetUser(user_id=twitter_id, include_entities=False)
+            except twitter.error.TwitterError as e:
+                self._handle_deleted(at_name, twitter_id, e)
+
+
+    def _handle_deleted(self, at_name, twitter_id, e, outer_exception_info=None):
+        """Error handling for blocking/unblocking of deleted/suspended users"""
+        if not self.db.in_original_process():
+            self.db = DatabaseAccess(self.db.fname)
+
+        if error_message(e, "User has been suspended."):
+            print "\t@%s (%d) is suspended" % (at_name, twitter_id)
+            self.db.deactivate_user_cause(twitter_id, self.cause_id)
+            self.db.set_user_deleted(twitter_id, SUSPENDED)
+            self.db.commit()
+
+        elif error_message(e, "User not found."):
+            print "\t@%s (%d) is deleted" % (at_name, twitter_id)
+            self.db.deactivate_user_cause(twitter_id, self.cause_id)
+            self.db.set_user_deleted(twitter_id, DELETED)
+            self.db.commit()
+
+        else:
+            if outer_exception_info:
+                e1 = outer_exception_info
+                traceback.print_exception(e1[0], e1[1], e1[2])
+            raise e
 
 
 
@@ -392,7 +460,7 @@ class FollowerBlocker (Blocker):
         self.db.commit()
         self.cause_id = self.db.get_cause("follows", self.root_at_name)
 
-        self.process_whitelist(self.cause_id)
+        self.process_whitelist()
 
 
     def __repr__(self):
@@ -417,7 +485,7 @@ class FollowerBlocker (Blocker):
 
         start = time.time()
 
-        print "\nGetting follower objects"
+        print "Getting follower objects"
         try:
             for i,chunk in enumerate(chunks):
                 args = [self.api, i, len(chunks)]
@@ -528,7 +596,7 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
         try:
             return api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)
         except twitter.error.TwitterError as e:
-            if error_message(e, RLE):
+            if error_message(e, RLE) or error_message(e, "Over capacity"):
                 continue
             else:
                 threadname = multiprocessing.current_process().name
@@ -536,7 +604,6 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
                 traceback.print_exc()
                 print e.message
                 print "==========================="
-
                 with open("error_logs/%s.log" % threadname, "w") as f:
                     traceback.print_exc(file=f)
 
@@ -546,13 +613,21 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
 def block_wrapper(blocker, user, i=0, total=1):
     """wrapper for Blocker.block() for threading"""
     write_percentage(i, total)
-    blocker.block(user)
+    sys.stdout.write(" : ")
+    try:
+        blocker.block(user)
+    except Exception as e:
+        threadname = multiprocessing.current_process().name
+        fname = "error_logs/%s.log" % threadname
+        with open(fname, "w") as f:
+            traceback.print_exc(file=f)
+        print e, "Logged to %s" % fname
 
 
 def simple_unblock(api, twitter_id, i=0, total=1):
     """Just unblock a user. No database stuff"""
     write_percentage(i, total)
-    print "Unblock %d" % twitter_id
+    print " : Unblock %d" % twitter_id
     try:
         api.DestroyBlock(user_id=twitter_id, include_entities=False, skip_status=True)
     except twitter.error.TwitterError as e:
@@ -568,7 +643,7 @@ def write_percentage(i, total, prefix=""):
     """print a progress tracker"""
     if prefix:
         sys.stdout.write(prefix + " ")
-    sys.stdout.write("%d/%d - %.4f%% : " % (i+1, total, float(i+1)*100/total))
+    sys.stdout.write("%d/%d - %.4f%%" % (i+1, total, float(i+1)*100/total))
 
 
 def error_message(e, msg):
@@ -654,8 +729,9 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 def main():
     db = DatabaseAccess("database.sqlite")
 
-    fb = FollowerBlocker(login("BlockMachine_RS"), db, "RichardBSpencer", True)
-    #fb.scan()
+    rs = FollowerBlocker(login("BlockMachine_RS"), db, "RichardBSpencer", True)
+    rs.scan()
+    #rs.sync_blocklist()
 
 
 if __name__ == "__main__":

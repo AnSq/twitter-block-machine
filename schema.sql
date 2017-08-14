@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS user_causes (
 );
 
 CREATE TABLE IF NOT EXISTS whitelist (
-    user_id TEXT PRIMARY KEY
+    user_id TEXT PRIMARY KEY,
+    at_name TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS deleted_types (
@@ -52,3 +53,9 @@ SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, use
 FROM users JOIN user_causes ON users.twitter_id==user_causes.user_id
 WHERE removed_count > 0
 ORDER BY added_count DESC, active DESC, removed_count DESC;
+
+CREATE VIEW IF NOT EXISTS deleted_users AS
+SELECT *
+FROM users
+WHERE deleted != 0
+ORDER BY deleted DESC;
