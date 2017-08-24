@@ -19,6 +19,7 @@ CONSUMER_FILE = "consumer.json"
 RLE = "Rate limit exceeded"
 DELETED = 1
 SUSPENDED = 2
+UNKNOWN_ERROR = set(['Unknown error: '])
 
 
 urllib3.disable_warnings()
@@ -266,25 +267,45 @@ class Blocker (object):
         return results
 
 
+    def _do_block_unblock(self, users_to_process, block):
+        """Block users, multithreaded.
+        block=True: block users; block=False: unblock users"""
+        which = "Blocking" if block else "Unblocking"
+        print "%s %d users..." % (which, len(users_to_process))
+        if len(users_to_process) > 0:
+            pool = multiprocessing.Pool(min(32, len(users_to_process)))
+            results = []
+            start = time.time()
+            try:
+                for i,user in enumerate(users_to_process):
+                    results.append(pool.apply_async(block_unblock_wrapper, [self, user, block, i, len(users_to_process)]))
+                pool.close()
+                for r in results:
+                    r.wait(999999999)
+            except KeyboardInterrupt:
+                pool.terminate()
+                print
+                sys.exit()
+            else:
+                pool.join()
+            print "%s completed in %.2f seconds" % (which, time.time() - start)
+        print
+
+
     def _do_block(self, users_to_block):
         """Block users, multithreaded"""
-        print "Blocking %d users..." % len(users_to_block)
-        pool = multiprocessing.Pool(min(32, len(users_to_block)))
-        results = []
-        start = time.time()
-        try:
-            for i,user in enumerate(users_to_block):
-                results.append(pool.apply_async(block_wrapper, [self, user, i, len(users_to_block)]))
-            pool.close()
-            for r in results:
-                r.wait(999999999)
-        except KeyboardInterrupt:
-            pool.terminate()
-            print
-            sys.exit()
-        else:
-            pool.join()
-        print "Blocking completed in %.2f seconds" % (time.time() - start)
+        self._do_block_unblock(users_to_block, True)
+
+
+    def _do_unblock(self, users_to_unblock):
+        """Unblock users, multithreaded"""
+        self._do_block_unblock(users_to_unblock, False)
+
+    def _threaded_database_fix(self):
+        """Replaces self.db with a new DatabaseAccess object if not in main process.
+        (sqlite3 package doesn't support using the same Cursor object in multiple processes.)"""
+        if not self.db.in_original_process():
+            self.db = DatabaseAccess(self.db.fname)
 
 
     def load_whitelist(self, fname="whitelist.txt"):
@@ -309,8 +330,6 @@ class Blocker (object):
         for u in users:
             self.db.add_whitelist(u.id, u.screen_name)
         self.db.commit()
-
-        print
 
 
     def process_whitelist(self):
@@ -361,11 +380,7 @@ class Blocker (object):
         to_unblock = twitter_list  - database_list
         to_block   = database_list - twitter_list
 
-        print "Unblocking %d users..." % len(to_unblock)
-        for i,twitter_id in enumerate(to_unblock):
-            write_percentage(i, len(to_unblock))
-            self.unblock(twitter_id)
-
+        self._do_unblock(to_unblock)
         self._do_block(to_block)
 
         self.db.commit()
@@ -377,8 +392,7 @@ class Blocker (object):
         """Block the user represented by the specified user object, Twitter ID, or [at_name, twitter_id] list or tuple"""
         if type(user) is int:
             twitter_id = user
-            if not self.db.in_original_process():
-                self.db = DatabaseAccess(self.db.fname)
+            self._threaded_database_fix()
             at_name = self.db.get_atname_by_id(twitter_id) or "???"
         elif type(user) is list or type(user) is tuple:
             at_name = user[0]
@@ -400,6 +414,7 @@ class Blocker (object):
 
     def unblock(self, twitter_id):
         """Unblock the user represented by the specified user ID"""
+        self._threaded_database_fix()
         at_name = self.db.get_atname_by_id(twitter_id)
         print "Unblock @%s (%d)" % (at_name, twitter_id)
 
@@ -461,6 +476,7 @@ class FollowerBlocker (Blocker):
         self.cause_id = self.db.get_cause("follows", self.root_at_name)
 
         self.process_whitelist()
+        print
 
 
     def __repr__(self):
@@ -521,24 +537,19 @@ class FollowerBlocker (Blocker):
             followers = self.get_followers()
 
         follower_ids = set(u.id for u in followers)
-        old_followers = self.db.get_user_ids_by_cause(self.cause_id)
+        old_followers = list(self.db.get_user_ids_by_cause(self.cause_id))
 
         whitelist = set(self.db.get_whitelist())
 
-        to_block = []
-        unblocks = 0
-
         # deactivate users that no longer follow the root user
         print "Calculating unblocks..."
-        for uid in old_followers:
-            if uid not in follower_ids:
-                self.db.deactivate_user_cause(uid, self.cause_id)
-                self.unblock(uid)
-                unblocks += 1
-        print
+        to_unblock = set(old_followers) - follower_ids
+        for uid in to_unblock:
+            self.db.deactivate_user_cause(uid, self.cause_id)
 
         # add and update users that do follow the root user
         print "Calculating blocks..."
+        to_block = []
         for follower in followers:
             whitelisted = follower.id in whitelist
 
@@ -554,9 +565,10 @@ class FollowerBlocker (Blocker):
 
         self.db.commit()
 
+        self._do_unblock(to_unblock)
         self._do_block(to_block)
 
-        print "\n%d blocks, %d unblocks\n" % (len(to_block), unblocks)
+        print "%d blocks, %d unblocks\n" % (len(to_block), len(to_unblock))
 
 
 
@@ -596,7 +608,7 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
         try:
             return api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)
         except twitter.error.TwitterError as e:
-            if error_message(e, RLE) or error_message(e, "Over capacity"):
+            if error_message(e, RLE) or error_message(e, "Over capacity") or e.message == UNKNOWN_ERROR:
                 continue
             else:
                 threadname = multiprocessing.current_process().name
@@ -610,12 +622,16 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
                 raise
 
 
-def block_wrapper(blocker, user, i=0, total=1):
-    """wrapper for Blocker.block() for threading"""
+def block_unblock_wrapper(blocker, user, block, i=0, total=1):
+    """wrapper of Blocker.block() and Blocker.unblock() for threading.
+    block=True: block user; block=False: unblock user """
     write_percentage(i, total)
     sys.stdout.write(" : ")
     try:
-        blocker.block(user)
+        if block:
+            blocker.block(user)
+        else:
+            blocker.unblock(user)
     except Exception as e:
         threadname = multiprocessing.current_process().name
         fname = "error_logs/%s.log" % threadname
@@ -643,7 +659,7 @@ def write_percentage(i, total, prefix=""):
     """print a progress tracker"""
     if prefix:
         sys.stdout.write(prefix + " ")
-    sys.stdout.write("%d/%d - %.4f%%" % (i+1, total, float(i+1)*100/total))
+    sys.stdout.write("%d/%d - %.2f%%" % (i+1, total, float(i+1)*100/total))
 
 
 def error_message(e, msg):
@@ -729,9 +745,19 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 def main():
     db = DatabaseAccess("database.sqlite")
 
-    rs = FollowerBlocker(login("BlockMachine_RS"), db, "RichardBSpencer", True)
-    rs.scan()
-    #rs.sync_blocklist()
+    a = 3
+    if a == 1:
+        rs = FollowerBlocker(login("BlockMachine_RS"), db, "RichardBSpencer", True)
+        rs.scan()
+        rs.sync_blocklist()
+    elif a == 2:
+        dd = FollowerBlocker(login("BlockMachine_DD"), db, "DrDavidDuke", True)
+        dd.scan()
+        dd.sync_blocklist()
+    elif a == 3:
+        jd = FollowerBlocker(login("BlockMachine_JD"), db, "Fired4Truth", True)
+        jd.scan()
+        jd.sync_blocklist()
 
 
 if __name__ == "__main__":

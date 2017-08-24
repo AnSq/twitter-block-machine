@@ -4,5 +4,8 @@ consumer.json
 *.token.json
 *.sqlite
 *.pyc
+*.txt
+*.ods
+.~lock.*
 whitelist.txt
 error_logs/

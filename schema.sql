@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS deleted_types (
 );
 
 CREATE VIEW IF NOT EXISTS removed_users AS
-SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count
+SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count, deleted
 FROM users JOIN user_causes ON users.twitter_id==user_causes.user_id
 WHERE removed_count > 0
 ORDER BY added_count DESC, active DESC, removed_count DESC;
