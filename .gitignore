@@ -6,6 +6,7 @@ consumer.json
 *.pyc
 *.txt
 *.ods
+*.old
 .~lock.*
 whitelist.txt
 error_logs/

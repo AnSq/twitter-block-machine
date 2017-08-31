@@ -22,9 +22,11 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS causes (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    cause_type TEXT    NOT NULL,
-    reason     TEXT    NOT NULL,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE,
+    cause_type  TEXT    NOT NULL,
+    reason      TEXT    NOT NULL,
+    bot_at_name TEXT,
     UNIQUE (cause_type, reason) ON CONFLICT IGNORE
 );
 
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS user_causes (
     user_id       TEXT    REFERENCES users(twitter_id),
     cause         INTEGER REFERENCES causes(id),
     citation      TEXT             DEFAULT NULL,
+    count         INTEGER          DEFAULT NULL,
     active        BOOLEAN NOT NULL DEFAULT 1,
     removed_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (user_id, cause) ON CONFLICT IGNORE

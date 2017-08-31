@@ -75,10 +75,19 @@ class DatabaseAccess (object):
         self.conn.rollback()
 
 
-    def add_cause(self, cause_type, reason):
+    def add_cause(self, name, cause_type, reason, bot_at_name=None):
         """Add a cause to the list of available causes. Does nothing if it already exists"""
+        data = {
+            "name"        : name,
+            "cause_type"  : cause_type,
+            "reason"      : reason,
+            "bot_at_name" : bot_at_name
+        }
+
+        self.cur.execute("UPDATE OR IGNORE causes SET cause_type=:cause_type, reason=:reason, bot_at_name=:bot_at_name WHERE name=:name", data)
+
         try:
-            self.cur.execute("INSERT OR FAIL INTO causes (cause_type, reason) VALUES (?,?);", [cause_type, reason])
+            self.cur.execute("INSERT OR FAIL INTO causes (name, cause_type, reason, bot_at_name) VALUES (:name, :cause_type, :reason, :bot_at_name);", data)
         except sqlite3.IntegrityError as e:
             pass
 
@@ -93,9 +102,9 @@ class DatabaseAccess (object):
         self.cur.execute("DELETE FROM whitelist;")
 
 
-    def get_cause(self, cause_type, reason):
+    def get_cause(self, name):
         """Get the ID of the given cause"""
-        rs = self.cur.execute("SELECT id FROM causes WHERE cause_type==? AND reason==?", [cause_type, reason])
+        rs = self.cur.execute("SELECT id FROM causes WHERE name==?", [name])
         row = rs.fetchone()
         return row[0] if row else None
 
@@ -141,19 +150,20 @@ class DatabaseAccess (object):
         )
 
 
-    def add_user_cause(self, user_id, cause_id, citation=None):
+    def add_user_cause(self, user_id, cause_id, citation=None, count=None):
         """Add a user-cause relationship to the database.
         Activates the relationship if it already exists.
         Does nothing if it's already active."""
         data = {
             "user_id":  str(user_id),
             "cause":    cause_id,
-            "citation": citation
+            "citation": citation,
+            "count":    count
         }
-        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, active=1 WHERE user_id==:user_id AND cause==:cause;", data)
+        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, count=:count, active=1 WHERE user_id==:user_id AND cause==:cause;", data)
 
         try:
-            self.cur.execute("INSERT OR FAIL INTO user_causes (user_id, cause, citation) VALUES (:user_id, :cause, :citation);", data)
+            self.cur.execute("INSERT OR FAIL INTO user_causes (user_id, cause, citation, count) VALUES (:user_id, :cause, :citation, :count);", data)
         except sqlite3.IntegrityError as e:
             pass
 
@@ -226,7 +236,8 @@ class DatabaseAccess (object):
 class Blocker (object):
     """Base object for blockers"""
 
-    def __init__(self, api, db, live=False):
+    def __init__(self, name, api, db, live=False):
+        self.name = name
         self.api = api
         self.db = db
         self.live = live
@@ -235,7 +246,7 @@ class Blocker (object):
 
 
     def __repr__(self):
-        return '<%s.%s [user="%s", db="%s"]>' % (self.__module__, self.__class__.__name__, self.username, self.db.fname)
+        return '<%s.%s [name="%s", user="%s", db="%s"]>' % (self.__module__, self.__class__.__name__, self.name, self.username, self.db.fname)
 
 
     def _get_ids_paged_ratelimited(self, num_pages, page_function, page_kwargs, endpoint):
@@ -301,6 +312,7 @@ class Blocker (object):
         """Unblock users, multithreaded"""
         self._do_block_unblock(users_to_unblock, False)
 
+
     def _threaded_database_fix(self):
         """Replaces self.db with a new DatabaseAccess object if not in main process.
         (sqlite3 package doesn't support using the same Cursor object in multiple processes.)"""
@@ -339,6 +351,7 @@ class Blocker (object):
             self.db.whitelist_user_cause(uid, self.cause_id)
             self.unblock(uid)
         self.db.commit()
+        print
 
 
     def get_blocklist(self):
@@ -444,13 +457,13 @@ class Blocker (object):
             self.db = DatabaseAccess(self.db.fname)
 
         if error_message(e, "User has been suspended."):
-            print "\t@%s (%d) is suspended" % (at_name, twitter_id)
+            print "\tsuspended: @%s (%d)" % (at_name, twitter_id)
             self.db.deactivate_user_cause(twitter_id, self.cause_id)
             self.db.set_user_deleted(twitter_id, SUSPENDED)
             self.db.commit()
 
         elif error_message(e, "User not found."):
-            print "\t@%s (%d) is deleted" % (at_name, twitter_id)
+            print "\tdeleted: @%s (%d)" % (at_name, twitter_id)
             self.db.deactivate_user_cause(twitter_id, self.cause_id)
             self.db.set_user_deleted(twitter_id, DELETED)
             self.db.commit()
@@ -466,33 +479,35 @@ class Blocker (object):
 class FollowerBlocker (Blocker):
     """Blocks the followers of one specific user (called the root user)"""
 
-    def __init__(self, api, db, root_at_name, live=False):
+    def __init__(self, name, api, db, root_at_name, live=False):
         """Initialize the object with root_at_name as the root user's twitter handle"""
-        super(FollowerBlocker, self).__init__(api, db, live)
+        Blocker.__init__(self, name, api, db, live)
         self.root_at_name = root_at_name
 
-        self.db.add_cause("follows", self.root_at_name)
+        self.db.add_cause(self.name, "follows", self.root_at_name, self.username)
         self.db.commit()
-        self.cause_id = self.db.get_cause("follows", self.root_at_name)
+        self.cause_id = self.db.get_cause(self.name)
 
         self.process_whitelist()
-        print
 
 
     def __repr__(self):
-        return '<%s.%s [user="%s", db="%s", root="%s"]>' % (self.__module__, self.__class__.__name__, self.username, self.db.fname, self.root_at_name)
+        return '<%s.%s [name="%s", user="%s", db="%s", root="%s"]>' % (self.__module__, self.__class__.__name__, self.name, self.username, self.db.fname, self.root_at_name)
 
 
-    def get_followers(self):
-        """Get the followers of the object's root user"""
-
-        root_user = self.api.GetUser(screen_name=self.root_at_name, include_entities=False)
+    def get_follower_ids(self, root_at_name):
+        """Get the follower IDs of the given root user"""
+        root_user = self.api.GetUser(screen_name=root_at_name, include_entities=False)
         print "Getting %d followers of @%s" % (root_user.followers_count, root_user.screen_name)
 
         print "Getting follower IDs"
         num_pages = int(math.ceil(float(root_user.followers_count)/5000))
-        follower_ids = self._get_ids_paged_ratelimited(num_pages, self.api.GetFollowerIDsPaged, {"screen_name":self.root_at_name}, "/followers/ids")
+        follower_ids = self._get_ids_paged_ratelimited(num_pages, self.api.GetFollowerIDsPaged, {"screen_name":root_at_name}, "/followers/ids")
+        return follower_ids
 
+
+    def get_follower_objects(self, follower_ids):
+        """Get the follower objects for the given follower ids"""
         chunks = chunkify(follower_ids, 100)
 
         pool = multiprocessing.Pool(32)
@@ -529,21 +544,28 @@ class FollowerBlocker (Blocker):
         return followers
 
 
+    def get_followers(self, root_at_name):
+        """Get the followers of the given root user"""
+        follower_ids = self.get_follower_ids(root_at_name)
+        followers = self.get_follower_objects(follower_ids)
+        return followers
+
+
     def scan(self, followers=None):
         """Do one pass of getting the root user's followers, updating the
         database, and blocking/unblocking as necessary"""
 
         if followers is None:
-            followers = self.get_followers()
+            followers = self.get_followers(self.root_at_name)
 
         follower_ids = set(u.id for u in followers)
-        old_followers = list(self.db.get_user_ids_by_cause(self.cause_id))
+        old_follower_ids = set(self.db.get_user_ids_by_cause(self.cause_id))
 
         whitelist = set(self.db.get_whitelist())
 
         # deactivate users that no longer follow the root user
         print "Calculating unblocks..."
-        to_unblock = set(old_followers) - follower_ids
+        to_unblock = old_follower_ids - follower_ids
         for uid in to_unblock:
             self.db.deactivate_user_cause(uid, self.cause_id)
 
@@ -562,6 +584,98 @@ class FollowerBlocker (Blocker):
             if whitelisted:
                 self.db.whitelist_user_cause(follower.id, self.cause_id) #...but don't activate it if whitelisted
         print
+
+        self.db.commit()
+
+        self._do_unblock(to_unblock)
+        self._do_block(to_block)
+
+        print "%d blocks, %d unblocks\n" % (len(to_block), len(to_unblock))
+
+
+
+class MultiFollowerBlocker (FollowerBlocker):
+    """Blocks the followers of multiple users."""
+
+    def __init__(self, name, api, db, root_at_names, live=False):
+        Blocker.__init__(self, name, api, db, live)
+        self.root_at_names = root_at_names
+
+        self.db.add_cause(self.name, "follows_any", ",".join(self.root_at_names), self.username)
+        self.db.commit()
+        self.cause_id = self.db.get_cause(self.name)
+
+        self.process_whitelist()
+
+
+    def __repr__(self):
+        return '<%s.%s [name="%s", user="%s", db="%s", roots=%s]>' % (self.__module__, self.__class__.__name__, self.name, self.username, self.db.fname, str(self.root_at_names))
+
+
+    def scan(self):
+        """Do one pass of getting the root users' followers, updating the
+        database, and blocking/unblocking as necessary"""
+        follower_ids = {}
+        for root_at_name in self.root_at_names:
+            follower_ids[root_at_name] = set(self.get_follower_ids(root_at_name))
+
+        all_follower_ids = set()
+        for root_at_name in follower_ids:
+            all_follower_ids |= follower_ids[root_at_name]
+        all_follower_ids = list(all_follower_ids)
+
+        #print
+        #for root_at_name in follower_ids:
+        #    print root_at_name, len(follower_ids[root_at_name])
+        #print
+        #s = sum(len(follower_ids[x]) for x in follower_ids)
+        #print s
+        t = len(all_follower_ids)
+        print t
+        #print s-t
+
+        follower_objects = self.get_follower_objects(all_follower_ids)
+        #print len(follower_objects)
+        all_follower_ids = set(u.id for u in follower_objects)
+        #print len(all_follower_ids)
+
+        old_follower_ids = set(self.db.get_user_ids_by_cause(self.cause_id))
+        #print len(old_follower_ids)
+
+        whitelist = set(self.db.get_whitelist())
+
+        print "Calculating unblocks..."
+        to_unblock = old_follower_ids - all_follower_ids
+        del old_follower_ids
+        del all_follower_ids
+        for uid in to_unblock:
+            self.db.deactivate_user_cause(uid, self.cause_id)
+
+        print "Calculating blocks..."
+        to_block = []
+        for follower in follower_objects:
+            whitelisted = follower.id in whitelist
+
+            if not whitelisted and not self.db.is_user_cause_active(follower.id, self.cause_id): #only block if not whitelisted
+                to_block.append(follower)
+
+            self.db.add_user(follower) #add user regardless of whitelist status
+
+            citation = []
+            for root_at_name in follower_ids:
+                if follower.id in follower_ids[root_at_name]:
+                    citation.append(root_at_name)
+            count = len(citation)
+            citation = ",".join(citation)
+
+            self.db.add_user_cause(follower.id, self.cause_id, citation, count) #add cause regardless of whitelist...
+            if whitelisted:
+                self.db.whitelist_user_cause(follower.id, self.cause_id) #...but don't activate it if whitelisted
+        print
+
+        del follower_ids
+        del follower_objects
+        del whitelist
 
         self.db.commit()
 
@@ -745,19 +859,57 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 def main():
     db = DatabaseAccess("database.sqlite")
 
-    a = 3
-    if a == 1:
-        rs = FollowerBlocker(login("BlockMachine_RS"), db, "RichardBSpencer", True)
+    a = [4]
+    if 1 in a:
+        rs = FollowerBlocker("Richard Spencer", login("BlockMachine_RS"), db, "RichardBSpencer", True)
         rs.scan()
-        rs.sync_blocklist()
-    elif a == 2:
-        dd = FollowerBlocker(login("BlockMachine_DD"), db, "DrDavidDuke", True)
+        #rs.sync_blocklist()
+    if 2 in a:
+        dd = FollowerBlocker("David Duke", login("BlockMachine_DD"), db, "DrDavidDuke", True)
         dd.scan()
-        dd.sync_blocklist()
-    elif a == 3:
-        jd = FollowerBlocker(login("BlockMachine_JD"), db, "Fired4Truth", True)
+        #dd.sync_blocklist()
+    if 3 in a:
+        jd = FollowerBlocker("James Damore", login("BlockMachine_JD"), db, "Fired4Truth", True)
         jd.scan()
-        jd.sync_blocklist()
+        #jd.sync_blocklist()
+    if 4 in a:
+        root_at_names = [
+            "BryanJFischer",
+            "DavidBartonWB",
+            "GDavidLane",
+            "garydemar",
+            "LouEngle",
+            "tperkins",
+            "AmericanFamAssc",
+            "AFAAction",
+            "AllianceDefends",
+            "FRCdc",
+            "FRCAction",
+            "libertycounsel",
+            "MatStaver",
+            "TVC_CapitolHill",
+            "WBCSaysRepent",
+            "PeterLaBarbera",
+            "AmericanVision",
+            "ATLAHWorldwide",
+            "DrJamesDManning",
+            "austinruse",
+            "FridayFax",
+            "RJRushdoony",
+            "sanderson1611",
+            "ProFamilyIFI",
+            "ILfamilyaction",
+            "MassResistance",
+            "PacificJustice",
+            "PublicFreedom",
+            "eugenedelgaudio",
+            "savecalifornia",
+            "UFI",
+            "ProFam_Org"
+        ]
+        al = MultiFollowerBlocker("anti-LGBT", login("BlockMachine_AL"), db, root_at_names, True)
+        al.scan()
+        #al.sync_blocklist()
 
 
 if __name__ == "__main__":
