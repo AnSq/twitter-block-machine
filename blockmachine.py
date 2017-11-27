@@ -26,6 +26,44 @@ urllib3.disable_warnings()
 
 
 
+class User (object):
+    """Simple object for storing information about a user"""
+
+    @staticmethod
+    def _replace_url_entities(user, attr):
+        """replace Twitter URL entities in the given attribute of the given twitter.models.User object and returns the result"""
+        s = user.__getattribute__(attr)
+        try:
+            for en in user._json["entities"][attr]["urls"]:
+                s = s.replace(en["url"], en["expanded_url"])
+        except KeyError as e:
+            pass
+        finally:
+            return s.replace("http://", "").replace("https://", "") if s else s
+
+
+    def __init__(self, user):
+        """Create a new User from the given twitter.models.User"""
+        self.id           = user.id
+        self.at_name      = user.screen_name
+        self.display_name = user.name
+        self.tweets       = user.statuses_count
+        self.following    = user.friends_count
+        self.followers    = user.followers_count
+        self.likes        = user.favourites_count
+        self.verified     = user.verified
+        self.protected    = user.protected
+        self.bio          = self._replace_url_entities(user, "description") or None
+        self.location     = user.location or None
+        self.url          = self._replace_url_entities(user, "url")
+        self.egg          = user.default_profile_image
+        self.created_at   = created_at(user.created_at)
+        self.lang         = user.lang or None
+        self.time_zone    = user.time_zone
+        self.utc_offset   = user.utc_offset
+
+
+
 class DatabaseAccess (object):
     """Provides access to the database"""
 
@@ -45,19 +83,6 @@ class DatabaseAccess (object):
 
     def __repr__(self):
         return '<%s.%s(fname="%s")>' % (self.__module__, self.__class__.__name__, self.fname)
-
-
-    @staticmethod
-    def _replace_url_entities(user, attr):
-        """replace Twitter URL entities in the given attribute of the given user and returns the result"""
-        s = user.__getattribute__(attr)
-        try:
-            for en in user._json["entities"][attr]["urls"]:
-                s = s.replace(en["url"], en["expanded_url"])
-        except KeyError as e:
-            pass
-        finally:
-            return s.replace("http://", "").replace("https://", "") if s else s
 
 
     def in_original_process(self):
@@ -113,21 +138,21 @@ class DatabaseAccess (object):
         """Add a user to the database, or updates them if they're already in it"""
 
         data = {
-            "twitter_id"   : str(user.id),
-            "at_name"      : user.screen_name,
-            "display_name" : user.name,
-            "tweets"       : user.statuses_count,
-            "following"    : user.friends_count,
-            "followers"    : user.followers_count,
-            "likes"        : user.favourites_count,
+            "user_id"      : str(user.id),
+            "at_name"      : user.at_name,
+            "display_name" : user.display_name,
+            "tweets"       : user.tweets,
+            "following"    : user.following,
+            "followers"    : user.followers,
+            "likes"        : user.likes,
             "verified"     : user.verified,
             "protected"    : user.protected,
-            "bio"          : self._replace_url_entities(user, "description") or None,
-            "location"     : user.location or None,
-            "url"          : self._replace_url_entities(user, "url"),
-            "egg"          : not user.default_profile_image,
-            "created_at"   : created_at(user.created_at),
-            "lang"         : user.lang or None,
+            "bio"          : user.bio,
+            "location"     : user.location,
+            "url"          : user.url,
+            "egg"          : user.egg,
+            "created_at"   : user.created_at,
+            "lang"         : user.lang,
             "time_zone"    : user.time_zone,
             "utc_offset"   : user.utc_offset,
             "deleted"      : 0
@@ -136,34 +161,34 @@ class DatabaseAccess (object):
         self.cur.execute("""
             UPDATE OR IGNORE users SET
             at_name=:at_name, display_name=:display_name, tweets=:tweets, following=:following, followers=:followers, likes=:likes, verified=:verified, protected=:protected, bio=:bio, location=:location, url=:url, egg=:egg, created_at=:created_at, lang=:lang, time_zone=:time_zone, utc_offset=:utc_offset, deleted=:deleted
-            WHERE twitter_id=:twitter_id;
+            WHERE user_id=:user_id;
             """,
             data
         )
 
         self.cur.execute ("""
             INSERT OR IGNORE INTO users
-            (        twitter_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  bio,  location,  url,  egg,  created_at,  lang,  time_zone,  utc_offset,  deleted)
-            VALUES (:twitter_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :bio, :location, :url, :egg, :created_at, :lang, :time_zone, :utc_offset, :deleted);
+            (        user_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  bio,  location,  url,  egg,  created_at,  lang,  time_zone,  utc_offset,  deleted)
+            VALUES (:user_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :bio, :location, :url, :egg, :created_at, :lang, :time_zone, :utc_offset, :deleted);
             """,
             data
         )
 
 
-    def add_user_cause(self, user_id, cause_id, citation=None, count=None):
+    def add_user_cause(self, user_id, cause_id, citation=None, cite_count=None):
         """Add a user-cause relationship to the database.
         Activates the relationship if it already exists.
         Does nothing if it's already active."""
         data = {
-            "user_id":  str(user_id),
-            "cause":    cause_id,
-            "citation": citation,
-            "count":    count
+            "user_id"    : str(user_id),
+            "cause"      : cause_id,
+            "citation"   : citation,
+            "cite_count" : cite_count
         }
-        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, count=:count, active=1 WHERE user_id==:user_id AND cause==:cause;", data)
+        self.cur.execute("UPDATE OR IGNORE user_causes SET citation=:citation, cite_count=:cite_count, active=1 WHERE user_id==:user_id AND cause==:cause;", data)
 
         try:
-            self.cur.execute("INSERT OR FAIL INTO user_causes (user_id, cause, citation, count) VALUES (:user_id, :cause, :citation, :count);", data)
+            self.cur.execute("INSERT OR FAIL INTO user_causes (user_id, cause, citation, cite_count) VALUES (:user_id, :cause, :citation, :cite_count);", data)
         except sqlite3.IntegrityError as e:
             pass
 
@@ -179,30 +204,30 @@ class DatabaseAccess (object):
                 yield int(r[0])
 
 
-    def deactivate_user_cause(self, twitter_id, cause_id):
+    def deactivate_user_cause(self, user_id, cause_id):
         """Deactivate a user-cause relationship.
         (Deactivated user-cause relationships represent users that previously
         matched a cause but don't anymore. For example, if they unfollowed the
         root user of a "follows" type cause. User-cause relationships can be
         reactivated if, for example, a user re-follows someone.)"""
-        self.cur.execute("UPDATE user_causes SET active=0, removed_count=removed_count+1 WHERE user_id==? AND cause==?;", [str(twitter_id), cause_id])
+        self.cur.execute("UPDATE user_causes SET active=0, removed_count=removed_count+1 WHERE user_id==? AND cause==?;", [str(user_id), cause_id])
 
 
-    def whitelist_user_cause(self, twitter_id, cause_id):
+    def whitelist_user_cause(self, user_id, cause_id):
         """Deactivate a user-cause relationship due to whitelisting.
         Does not increment removed_count."""
-        self.cur.execute("UPDATE user_causes SET active=0 WHERE user_id==? AND cause==?;", [str(twitter_id), cause_id])
+        self.cur.execute("UPDATE user_causes SET active=0 WHERE user_id==? AND cause==?;", [str(user_id), cause_id])
 
 
-    def is_user_cause_active(self, twitter_id, cause_id):
+    def is_user_cause_active(self, user_id, cause_id):
         """Check if a user-cause relationship is active"""
-        rs = self.cur.execute("SELECT user_id FROM user_causes WHERE user_id==? AND cause==? AND active==1;", [str(twitter_id), cause_id])
+        rs = self.cur.execute("SELECT user_id FROM user_causes WHERE user_id==? AND cause==? AND active==1;", [str(user_id), cause_id])
         return bool(rs.fetchone())
 
 
-    def get_atname_by_id(self, twitter_id):
+    def get_atname_by_id(self, user_id):
         """get the at_name associated with a Twitter ID"""
-        rs = self.cur.execute("SELECT at_name FROM users WHERE twitter_id==?;", [str(twitter_id)])
+        rs = self.cur.execute("SELECT at_name FROM users WHERE user_id==?;", [str(user_id)])
         result = rs.fetchone()
         if result:
             return result[0]
@@ -213,8 +238,8 @@ class DatabaseAccess (object):
     def get_active_whitelisted(self, cause_id):
         """Get user IDs that are active with the given cause and whitelisted."""
         rs = self.cur.execute("""
-            SELECT twitter_id FROM users JOIN user_causes ON twitter_id==user_id
-            WHERE cause==? AND active==1 AND twitter_id IN (SELECT user_id FROM whitelist);
+            SELECT users.user_id FROM users JOIN user_causes ON users.user_id==user_causes.user_id
+            WHERE cause==? AND active==1 AND users.user_id IN (SELECT user_id FROM whitelist);
             """,
             [cause_id]
         )
@@ -227,9 +252,9 @@ class DatabaseAccess (object):
         return [int(x[0]) for x in rs.fetchall()]
 
 
-    def set_user_deleted(self, twitter_id, deleted_status):
+    def set_user_deleted(self, user_id, deleted_status):
         """mark the given user as deleted or suspended"""
-        self.cur.execute("UPDATE users SET deleted=? WHERE twitter_id==?;", [deleted_status, str(twitter_id)])
+        self.cur.execute("UPDATE users SET deleted=? WHERE user_id==?;", [deleted_status, str(user_id)])
 
 
 
@@ -340,7 +365,7 @@ class Blocker (object):
         self.db.clear_whitelist()
 
         for u in users:
-            self.db.add_whitelist(u.id, u.screen_name)
+            self.db.add_whitelist(u.id, u.at_name)
         self.db.commit()
 
 
@@ -369,8 +394,8 @@ class Blocker (object):
         results = []
         start = time.time()
         try:
-            for i,twitter_id in enumerate(blocklist):
-                results.append(pool.apply_async(simple_unblock, [self.api, twitter_id, i, len(blocklist)]))
+            for i,user_id in enumerate(blocklist):
+                results.append(pool.apply_async(simple_unblock, [self.api, user_id, i, len(blocklist)]))
             pool.close()
             for r in results:
                 r.wait(999999999)
@@ -402,70 +427,70 @@ class Blocker (object):
 
 
     def block(self, user):
-        """Block the user represented by the specified user object, Twitter ID, or [at_name, twitter_id] list or tuple"""
+        """Block the user represented by the specified User object, Twitter ID, or [at_name, user_id] list or tuple"""
         if type(user) is int:
-            twitter_id = user
+            user_id = user
             self._threaded_database_fix()
-            at_name = self.db.get_atname_by_id(twitter_id) or "???"
+            at_name = self.db.get_atname_by_id(user_id) or "???"
         elif type(user) is list or type(user) is tuple:
             at_name = user[0]
-            twitter_id = user[1]
+            user_id = user[1]
         else:
-            at_name = user.screen_name
-            twitter_id = user.id
+            at_name = user.at_name
+            user_id = user.id
 
-        print "Block @%s (%d)" % (at_name, twitter_id)
+        print "Block @%s (%d)" % (at_name, user_id)
 
         try:
             if self.live:
-                self.api.CreateBlock(user_id=twitter_id, include_entities=False, skip_status=True)
+                self.api.CreateBlock(user_id=user_id, include_entities=False, skip_status=True)
             else:
-                user = self.api.GetUser(user_id=twitter_id, include_entities=False)
+                user = self.api.GetUser(user_id=user_id, include_entities=False)
         except twitter.error.TwitterError as e:
-            self._handle_deleted(at_name, twitter_id, e)
+            self._handle_deleted(at_name, user_id, e)
 
 
-    def unblock(self, twitter_id):
+    def unblock(self, user_id):
         """Unblock the user represented by the specified user ID"""
         self._threaded_database_fix()
-        at_name = self.db.get_atname_by_id(twitter_id)
-        print "Unblock @%s (%d)" % (at_name, twitter_id)
+        at_name = self.db.get_atname_by_id(user_id)
+        print "Unblock @%s (%d)" % (at_name, user_id)
 
         if self.live:
             try:
-                self.api.DestroyBlock(user_id=twitter_id, include_entities=False, skip_status=True)
+                self.api.DestroyBlock(user_id=user_id, include_entities=False, skip_status=True)
             except twitter.error.TwitterError as e:
                 outer_exception_info = sys.exc_info()
                 if error_message(e, "Sorry, that page does not exist."): #this probably means the user is suspended or deleted
                     try:
-                        user = self.api.GetUser(user_id=twitter_id, include_entities=False) #if the user is suspended, this will throw an error
+                        user = self.api.GetUser(user_id=user_id, include_entities=False) #if the user is suspended, this will throw an error
                         raise Exception("DestroyBlock threw \"page does not exist\" but GetUser didn't throw aything (for @%s)" % user.screen_name)
                     except twitter.error.TwitterError as inner_exception:
-                        self._handle_deleted(at_name, twitter_id, inner_exception, outer_exception_info)
+                        self._handle_deleted(at_name, user_id, inner_exception, outer_exception_info)
                 else:
                     raise
         else:
             try:
-                self.api.GetUser(user_id=twitter_id, include_entities=False)
+                self.api.GetUser(user_id=user_id, include_entities=False)
             except twitter.error.TwitterError as e:
-                self._handle_deleted(at_name, twitter_id, e)
+                self._handle_deleted(at_name, user_id, e)
 
 
-    def _handle_deleted(self, at_name, twitter_id, e, outer_exception_info=None):
+    def _handle_deleted(self, at_name, user_id, e, outer_exception_info=None):
         """Error handling for blocking/unblocking of deleted/suspended users"""
         if not self.db.in_original_process():
             self.db = DatabaseAccess(self.db.fname)
 
         if error_message(e, "User has been suspended."):
-            print "\tsuspended: @%s (%d)" % (at_name, twitter_id)
-            self.db.deactivate_user_cause(twitter_id, self.cause_id)
-            self.db.set_user_deleted(twitter_id, SUSPENDED)
+            print "\tsuspended: @%s (%d)" % (at_name, user_id)
+            self.db.deactivate_user_cause(user_id, self.cause_id)
+            self.db.set_user_deleted(user_id, SUSPENDED)
             self.db.commit()
 
         elif error_message(e, "User not found."):
-            print "\tdeleted: @%s (%d)" % (at_name, twitter_id)
-            self.db.deactivate_user_cause(twitter_id, self.cause_id)
-            self.db.set_user_deleted(twitter_id, DELETED)
+            print "\tdeleted: @%s (%d)" % (at_name, user_id)
+            self.db.deactivate_user_cause(user_id, self.cause_id)
+            self.db.set_user_deleted(user_id, DELETED)
             self.db.commit()
 
         else:
@@ -473,6 +498,19 @@ class Blocker (object):
                 e1 = outer_exception_info
                 traceback.print_exception(e1[0], e1[1], e1[2])
             raise e
+
+
+    def filter_users(self, users):
+        """returns the subset of `users` that have tweeted and are not protected"""
+        result = []
+        removed_count = 0
+        for u in users:
+            if u.tweets > 0 and not u.protected:
+                result.append(u)
+            else:
+                removed_count += 1
+        print "%d users filtered" % removed_count
+        return result
 
 
 
@@ -556,7 +594,7 @@ class FollowerBlocker (Blocker):
         database, and blocking/unblocking as necessary"""
 
         if followers is None:
-            followers = self.get_followers(self.root_at_name)
+            followers = self.filter_users(self.get_followers(self.root_at_name))
 
         follower_ids = set(u.id for u in followers)
         old_follower_ids = set(self.db.get_user_ids_by_cause(self.cause_id))
@@ -624,23 +662,13 @@ class MultiFollowerBlocker (FollowerBlocker):
             all_follower_ids |= follower_ids[root_at_name]
         all_follower_ids = list(all_follower_ids)
 
-        #print
-        #for root_at_name in follower_ids:
-        #    print root_at_name, len(follower_ids[root_at_name])
-        #print
-        #s = sum(len(follower_ids[x]) for x in follower_ids)
-        #print s
         t = len(all_follower_ids)
         print t
-        #print s-t
 
-        follower_objects = self.get_follower_objects(all_follower_ids)
-        #print len(follower_objects)
+        follower_objects = self.filter_users(self.get_follower_objects(all_follower_ids))
         all_follower_ids = set(u.id for u in follower_objects)
-        #print len(all_follower_ids)
 
         old_follower_ids = set(self.db.get_user_ids_by_cause(self.cause_id))
-        #print len(old_follower_ids)
 
         whitelist = set(self.db.get_whitelist())
 
@@ -657,7 +685,7 @@ class MultiFollowerBlocker (FollowerBlocker):
             whitelisted = follower.id in whitelist
 
             if not whitelisted and not self.db.is_user_cause_active(follower.id, self.cause_id): #only block if not whitelisted
-                to_block.append(follower)
+                to_block.append((follower.at_name,follower.id))
 
             self.db.add_user(follower) #add user regardless of whitelist status
 
@@ -665,10 +693,10 @@ class MultiFollowerBlocker (FollowerBlocker):
             for root_at_name in follower_ids:
                 if follower.id in follower_ids[root_at_name]:
                     citation.append(root_at_name)
-            count = len(citation)
+            cite_count = len(citation)
             citation = ",".join(citation)
 
-            self.db.add_user_cause(follower.id, self.cause_id, citation, count) #add cause regardless of whitelist...
+            self.db.add_user_cause(follower.id, self.cause_id, citation, cite_count) #add cause regardless of whitelist...
             if whitelisted:
                 self.db.whitelist_user_cause(follower.id, self.cause_id) #...but don't activate it if whitelisted
         print
@@ -720,7 +748,7 @@ def lookup_users_chunk(api, i, num_chunks, user_ids=None, at_names=None):
     while True:
         limit_block(api, "/users/lookup", i)
         try:
-            return api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)
+            return [User(x) for x in api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)]
         except twitter.error.TwitterError as e:
             if error_message(e, RLE) or error_message(e, "Over capacity") or e.message == UNKNOWN_ERROR:
                 continue
@@ -754,14 +782,14 @@ def block_unblock_wrapper(blocker, user, block, i=0, total=1):
         print e, "Logged to %s" % fname
 
 
-def simple_unblock(api, twitter_id, i=0, total=1):
+def simple_unblock(api, user_id, i=0, total=1):
     """Just unblock a user. No database stuff"""
     write_percentage(i, total)
-    print " : Unblock %d" % twitter_id
+    print " : Unblock %d" % user_id
     try:
-        api.DestroyBlock(user_id=twitter_id, include_entities=False, skip_status=True)
+        api.DestroyBlock(user_id=user_id, include_entities=False, skip_status=True)
     except twitter.error.TwitterError as e:
-        print "Error:", twitter_id, e.message
+        print "Error:", user_id, e.message
 
 
 def cr():
@@ -859,7 +887,7 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 def main():
     db = DatabaseAccess("database.sqlite")
 
-    a = [4]
+    a = [2]
     if 1 in a:
         rs = FollowerBlocker("Richard Spencer", login("BlockMachine_RS"), db, "RichardBSpencer", True)
         rs.scan()
@@ -869,7 +897,7 @@ def main():
         dd.scan()
         #dd.sync_blocklist()
     if 3 in a:
-        jd = FollowerBlocker("James Damore", login("BlockMachine_JD"), db, "Fired4Truth", True)
+        jd = FollowerBlocker("James Damore", login("BlockMachine_JD"), db, "JamesADamore", True)
         jd.scan()
         #jd.sync_blocklist()
     if 4 in a:
@@ -910,6 +938,10 @@ def main():
         al = MultiFollowerBlocker("anti-LGBT", login("BlockMachine_AL"), db, root_at_names, True)
         al.scan()
         #al.sync_blocklist()
+    if 5 in a:
+        sm = FollowerBlocker("Stefan Molyneux", login("BlockMachine_SM"), db, "StefanMolyneux", True)
+        sm.scan()
+        #sm.sync_blocklist()
 
 
 if __name__ == "__main__":

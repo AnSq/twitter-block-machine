@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
-    twitter_id   TEXT    PRIMARY KEY,
+    user_id      TEXT    PRIMARY KEY,
     at_name      TEXT    NOT NULL,
     display_name TEXT    NOT NULL,
     tweets       INTEGER NOT NULL,
@@ -32,10 +32,10 @@ CREATE TABLE IF NOT EXISTS causes (
 
 CREATE TABLE IF NOT EXISTS user_causes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       TEXT    REFERENCES users(twitter_id),
+    user_id       TEXT    REFERENCES users(user_id),
     cause         INTEGER REFERENCES causes(id),
     citation      TEXT             DEFAULT NULL,
-    count         INTEGER          DEFAULT NULL,
+    cite_count    INTEGER          DEFAULT NULL,
     active        BOOLEAN NOT NULL DEFAULT 1,
     removed_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (user_id, cause) ON CONFLICT IGNORE
@@ -52,8 +52,8 @@ CREATE TABLE IF NOT EXISTS deleted_types (
 );
 
 CREATE VIEW IF NOT EXISTS removed_users AS
-SELECT user_causes.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count, deleted
-FROM users JOIN user_causes ON users.twitter_id==user_causes.user_id
+SELECT users.user_id, users.at_name, users.display_name, users.tweets, users.following, users.followers, users.bio, user_causes.cause, user_causes.active, user_causes.removed_count, user_causes.active+user_causes.removed_count AS added_count, deleted
+FROM users JOIN user_causes ON users.user_id == user_causes.user_id
 WHERE removed_count > 0
 ORDER BY added_count DESC, active DESC, removed_count DESC;
 
@@ -62,3 +62,8 @@ SELECT *
 FROM users
 WHERE deleted != 0
 ORDER BY deleted DESC;
+
+
+CREATE VIEW IF NOT EXISTS uuu AS
+SELECT *
+FROM users JOIN user_causes ON users.user_id == user_causes.user_id;
