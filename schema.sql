@@ -22,11 +22,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS causes (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL UNIQUE,
-    cause_type  TEXT    NOT NULL,
-    reason      TEXT    NOT NULL,
-    bot_at_name TEXT,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,
+    cause_type      TEXT    NOT NULL,
+    reason          TEXT    NOT NULL,
+    bot_at_name     TEXT,
+    tweet_threshold INTEGER DEFAULT 1,
     UNIQUE (cause_type, reason) ON CONFLICT IGNORE
 );
 

@@ -20,6 +20,7 @@ RLE = "Rate limit exceeded"
 DELETED = 1
 SUSPENDED = 2
 UNKNOWN_ERROR = set(['Unknown error: '])
+REQUEST_TIMEOUT = 60
 
 
 urllib3.disable_warnings()
@@ -100,19 +101,20 @@ class DatabaseAccess (object):
         self.conn.rollback()
 
 
-    def add_cause(self, name, cause_type, reason, bot_at_name=None):
+    def add_cause(self, name, cause_type, reason, bot_at_name=None, tweet_threshold=1):
         """Add a cause to the list of available causes. Does nothing if it already exists"""
         data = {
-            "name"        : name,
-            "cause_type"  : cause_type,
-            "reason"      : reason,
-            "bot_at_name" : bot_at_name
+            "name"            : name,
+            "cause_type"      : cause_type,
+            "reason"          : reason,
+            "bot_at_name"     : bot_at_name,
+            "tweet_threshold" : tweet_threshold
         }
 
-        self.cur.execute("UPDATE OR IGNORE causes SET cause_type=:cause_type, reason=:reason, bot_at_name=:bot_at_name WHERE name=:name", data)
+        self.cur.execute("UPDATE OR IGNORE causes SET cause_type=:cause_type, reason=:reason, bot_at_name=:bot_at_name, tweet_threshold=:tweet_threshold WHERE name=:name", data)
 
         try:
-            self.cur.execute("INSERT OR FAIL INTO causes (name, cause_type, reason, bot_at_name) VALUES (:name, :cause_type, :reason, :bot_at_name);", data)
+            self.cur.execute("INSERT OR FAIL INTO causes (name, cause_type, reason, bot_at_name, tweet_threshold) VALUES (:name, :cause_type, :reason, :bot_at_name, :tweet_threshold);", data)
         except sqlite3.IntegrityError as e:
             pass
 
@@ -261,10 +263,11 @@ class DatabaseAccess (object):
 class Blocker (object):
     """Base object for blockers"""
 
-    def __init__(self, name, api, db, live=False):
+    def __init__(self, name, api, db, tweet_threshold=1, live=False):
         self.name = name
         self.api = api
         self.db = db
+        self.tweet_threshold = tweet_threshold
         self.live = live
         self.load_whitelist()
         self.username = api.VerifyCredentials().screen_name
@@ -284,7 +287,10 @@ class Blocker (object):
             limit_block(self.api, endpoint, i)
 
             cr()
-            sys.stdout.write("page %d/%d" % (i+1, num_pages))
+            if num_pages is None:
+                sys.stdout.write("page %d" % (i+1))
+            else:
+                sys.stdout.write("page %d/%d" % (i+1, num_pages))
             sys.stdout.flush()
 
             try:
@@ -381,7 +387,7 @@ class Blocker (object):
 
     def get_blocklist(self):
         """return a list of user IDs that are blocked by the logged in user"""
-        return self._get_ids_paged_ratelimited(1, self.api.GetBlocksIDsPaged, {}, "/blocks/ids")
+        return self._get_ids_paged_ratelimited(None, self.api.GetBlocksIDsPaged, {}, "/blocks/ids")
 
 
     def clear_blocklist(self, blocklist=None):
@@ -501,11 +507,11 @@ class Blocker (object):
 
 
     def filter_users(self, users):
-        """returns the subset of `users` that have tweeted and are not protected"""
+        """returns the subset of `users` that have tweeted at least as many times as this bot's threshold and are not protected"""
         result = []
         removed_count = 0
         for u in users:
-            if u.tweets > 0 and not u.protected:
+            if u.tweets >= self.tweet_threshold and not u.protected:
                 result.append(u)
             else:
                 removed_count += 1
@@ -517,12 +523,12 @@ class Blocker (object):
 class FollowerBlocker (Blocker):
     """Blocks the followers of one specific user (called the root user)"""
 
-    def __init__(self, name, api, db, root_at_name, live=False):
+    def __init__(self, name, api, db, root_at_name, tweet_threshold=1, live=False):
         """Initialize the object with root_at_name as the root user's twitter handle"""
-        Blocker.__init__(self, name, api, db, live)
+        Blocker.__init__(self, name, api, db, tweet_threshold, live)
         self.root_at_name = root_at_name
 
-        self.db.add_cause(self.name, "follows", self.root_at_name, self.username)
+        self.db.add_cause(self.name, "follows", self.root_at_name, self.username, self.tweet_threshold)
         self.db.commit()
         self.cause_id = self.db.get_cause(self.name)
 
@@ -635,11 +641,11 @@ class FollowerBlocker (Blocker):
 class MultiFollowerBlocker (FollowerBlocker):
     """Blocks the followers of multiple users."""
 
-    def __init__(self, name, api, db, root_at_names, live=False):
-        Blocker.__init__(self, name, api, db, live)
+    def __init__(self, name, api, db, root_at_names, tweet_threshold=1, live=False):
+        Blocker.__init__(self, name, api, db, tweet_threshold, live)
         self.root_at_names = root_at_names
 
-        self.db.add_cause(self.name, "follows_any", ",".join(self.root_at_names), self.username)
+        self.db.add_cause(self.name, "follows_any", ",".join(self.root_at_names), self.username, self.tweet_threshold)
         self.db.commit()
         self.cause_id = self.db.get_cause(self.name)
 
@@ -862,6 +868,7 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
         consumer_secret=consumer_secret,
         access_token_key=access_token,
         access_token_secret=access_token_secret,
+        timeout=REQUEST_TIMEOUT,
         sleep_on_rate_limit=sleep
     )
 
@@ -887,19 +894,19 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 def main():
     db = DatabaseAccess("database.sqlite")
 
-    a = [2]
+    a = [5]
     if 1 in a:
-        rs = FollowerBlocker("Richard Spencer", login("BlockMachine_RS"), db, "RichardBSpencer", True)
-        rs.scan()
-        #rs.sync_blocklist()
+        rs = FollowerBlocker("Richard Spencer", login("BlockMachine_RS"), db, "RichardBSpencer", 1, True)
+        #rs.scan()
+        rs.sync_blocklist()
     if 2 in a:
-        dd = FollowerBlocker("David Duke", login("BlockMachine_DD"), db, "DrDavidDuke", True)
-        dd.scan()
-        #dd.sync_blocklist()
+        dd = FollowerBlocker("David Duke", login("BlockMachine_DD"), db, "DrDavidDuke", 1, True)
+        #dd.scan()
+        dd.sync_blocklist()
     if 3 in a:
-        jd = FollowerBlocker("James Damore", login("BlockMachine_JD"), db, "JamesADamore", True)
-        jd.scan()
-        #jd.sync_blocklist()
+        jd = FollowerBlocker("James Damore", login("BlockMachine_JD"), db, "JamesADamore", 1, True)
+        #jd.scan()
+        jd.sync_blocklist()
     if 4 in a:
         root_at_names = [
             "BryanJFischer",
@@ -935,11 +942,11 @@ def main():
             "UFI",
             "ProFam_Org"
         ]
-        al = MultiFollowerBlocker("anti-LGBT", login("BlockMachine_AL"), db, root_at_names, True)
+        al = MultiFollowerBlocker("anti-LGBT", login("BlockMachine_AL"), db, root_at_names, 1, True)
         al.scan()
         #al.sync_blocklist()
     if 5 in a:
-        sm = FollowerBlocker("Stefan Molyneux", login("BlockMachine_SM"), db, "StefanMolyneux", True)
+        sm = FollowerBlocker("Stefan Molyneux", login("BlockMachine_SM"), db, "StefanMolyneux", 5, True)
         sm.scan()
         #sm.sync_blocklist()
 
