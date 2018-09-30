@@ -4,6 +4,7 @@ get_access_token.py
 consumer.json
 *.token.json
 *.sqlite
+*.sqlite-*
 *.pyc
 *.txt
 *.ods
@@ -14,5 +15,9 @@ consumer.json
 *.tgf
 *.dot
 *.graphml
+*.cfg
+*.json
+*.csv
 whitelist.txt
 error_logs/
+!requirements.txt

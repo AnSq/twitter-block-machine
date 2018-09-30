@@ -7,7 +7,13 @@ import time
 import math
 import sqlite3
 import multiprocessing
+import multiprocessing.pool
+import threading
+import queue
 import traceback
+import itertools
+import collections
+import re
 
 import requests
 import requests_oauthlib
@@ -15,17 +21,22 @@ import twitter
 
 
 CONSUMER_FILE = "consumer.json"
+ROOT_USERS_FILE = "root_users.cfg"
+SQLITE_PCRE = "/usr/lib/sqlite3/pcre.so"
+
+REQUEST_TIMEOUT = 60
+MAX_THREADS = 1
+DELETED = "deleted"
+SUSPENDED = "suspended"
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# errors
 RLE = "Rate limit exceeded"
 UNKNOWN_ERROR = set(['Unknown error: '])
 SUSPENDED_ERROR = "User has been suspended."
 USER_NOT_FOUND = "User not found."
 INTERNAL_ERROR = "Internal error"
 OVER_CAPACITY = "Over capacity"
-REQUEST_TIMEOUT = 60
-MAX_THREADS = 8
-DELETED = "deleted"
-SUSPENDED = "suspended"
-TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 
@@ -63,14 +74,13 @@ class User:
         self.egg             = user.default_profile_image
         self.created_at      = created_at(user.created_at)
         self.lang            = user.lang or None
-        self.time_zone       = user.time_zone
-        self.utc_offset      = user.utc_offset
         self.last_tweet_time = created_at(user.status.created_at) if user.status else None
         self.updated_at      = time_now()
 
 
     def __repr__(self):
         return '<{}{} @{} "{}" #{}>'.format(module_repr(self), cls_repr(self), self.at_name, self.display_name, self.id)
+
 
 
 class DatabaseAccess:
@@ -84,6 +94,10 @@ class DatabaseAccess:
         self.conn = sqlite3.connect(self.fname)
         self.cur = self.conn.cursor()
 
+        #self.conn.create_function("REGEXP", 2, self._function_regexp)
+        self.conn.enable_load_extension(True)
+        self.conn.load_extension(SQLITE_PCRE)
+
         with open("schema.sql") as f:
             self.cur.executescript(f.read())
         self.commit()
@@ -91,6 +105,13 @@ class DatabaseAccess:
 
     def __repr__(self):
         return '<{}{}(fname="{}")>'.format(module_repr(self), cls_repr(self), self.fname)
+
+
+    @staticmethod
+    def _function_regexp(pattern, string):
+        if not string:
+            return False
+        return re.search(pattern, string, re.IGNORECASE) is not None
 
 
     def in_original_process(self):
@@ -137,8 +158,6 @@ class DatabaseAccess:
             "egg"             : user.egg,
             "created_at"      : user.created_at,
             "lang"            : user.lang,
-            "time_zone"       : user.time_zone,
-            "utc_offset"      : user.utc_offset,
             "last_tweet_time" : user.last_tweet_time,
             "deleted"         : None,
             "updated_at"      : user.updated_at
@@ -150,8 +169,7 @@ class DatabaseAccess:
             following=:following, followers=:followers, likes=:likes,
             verified=:verified, protected=:protected, bio=:bio,
             location=:location, url=:url, egg=:egg, created_at=:created_at,
-            lang=:lang, time_zone=:time_zone, utc_offset=:utc_offset,
-            last_tweet_time=:last_tweet_time, deleted=:deleted,
+            lang=:lang, last_tweet_time=:last_tweet_time, deleted=:deleted,
             updated_at=:updated_at
             WHERE user_id=:user_id;
             """,
@@ -160,8 +178,8 @@ class DatabaseAccess:
 
         self.cur.execute ("""
             INSERT OR IGNORE INTO users
-            (        user_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  bio,  location,  url,  egg,  created_at,  lang,  time_zone,  utc_offset,  last_tweet_time,  deleted,  updated_at)
-            VALUES (:user_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :bio, :location, :url, :egg, :created_at, :lang, :time_zone, :utc_offset, :last_tweet_time, :deleted, :updated_at);
+            (        user_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  bio,  location,  url,  egg,  created_at,  lang,  last_tweet_time,  deleted,  updated_at)
+            VALUES (:user_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :bio, :location, :url, :egg, :created_at, :lang, :last_tweet_time, :deleted, :updated_at);
             """,
             data
         )
@@ -258,8 +276,8 @@ class DatabaseAccess:
 
             self.cur.execute("""
                 UPDATE OR IGNORE root_users
-                SET comment=:comment
-                WHERE user_id=:user_id AND at_name=:at_name;
+                SET comment=:comment, at_name=:at_name
+                WHERE user_id=:user_id;
                 """,
                 data
             )
@@ -272,10 +290,48 @@ class DatabaseAccess:
         self.cur.execute("UPDATE root_users SET followers_updated_at=? WHERE user_id=?", [followers_updated_at, user_id])
 
 
-    def get_root_users(self):
-        """get the at_name of every root user"""
-        rs = self.cur.execute("SELECT at_name FROM root_users;")
+    def get_new_root_users(self):
+        """get the at_name of root users that have never been updated"""
+        rs = self.cur.execute("SELECT at_name FROM root_users WHERE followers_updated_at IS NULL;")
         return [x[0] for x in rs.fetchall()]
+
+
+    def search_users(self, terms):
+        """Get user_ids matching a set of search terms.
+        A user will be included in the result if it matches at
+        least one of the terms (i.e., they are ORed together)"""
+        fields = ["at_name", "display_name", "bio", "url"]
+        query = "SELECT user_id FROM users WHERE 0"
+        params = []
+        for t in terms:
+            for i,field in enumerate(fields):
+                if terms[t][i]:
+                    query += " OR coalesce(lower({}),'') REGEXP ?".format(field)
+                    params.append(t)
+        query += ";"
+
+        rs = self.cur.execute(query, params)
+        while True:
+            chunk = rs.fetchmany(256)
+            if not chunk:
+                break
+            for r in chunk:
+                yield r[0]
+
+
+    def search_users_test(self, terms):
+        fields = ["at_name", "display_name", "bio", "url"]
+        query = "SELECT user_id FROM users WHERE coalesce(lower({}),'') REGEXP ?"
+        for t in terms:
+            print()
+            print('"{}",'.format(t), end="", flush=True)
+            for i,field in enumerate(fields):
+                if terms[t][i]:
+                    rs = self.cur.execute(query.format(field), (t,))
+                    print("{},".format(len(rs.fetchall())), end="", flush=True)
+                else:
+                    print(",", end="", flush=True)
+        print()
 
 
 
@@ -296,7 +352,6 @@ class BlockMachine:
     def _get_ids_paged_ratelimited(self, num_pages, page_function, page_kwargs, endpoint):
         """Get paginated IDs, handling ratelimiting"""
         cursor = -1
-        results = []
 
         i = 0
         while True:
@@ -304,25 +359,27 @@ class BlockMachine:
 
             cr()
             if num_pages is None:
-                sys.stdout.write("page %d" % (i+1))
+                print("page {}".format(i+1))
             else:
-                sys.stdout.write("page %d/%d" % (i+1, num_pages))
+                write_percentage(i, num_pages, "page")
+                print()
             sys.stdout.flush()
 
             try:
                 cursor, _prev_cursor, chunk = page_function(cursor=cursor, **page_kwargs)
             except twitter.error.TwitterError as e:
-                if error_message(e, RLE): continue
-                else: raise
-            results += chunk
+                if error_message(e, RLE):
+                    continue
+                else:
+                    raise
+
+            for user_id in chunk:
+                yield user_id
 
             i += 1
 
             if cursor == 0:
                 break
-
-        print()
-        return results
 
 
     def _rate_limit(self, endpoint, i=-1):
@@ -518,79 +575,106 @@ class BlockMachine:
 
     def get_followers(self, root_at_name):
         """Get the followers of the given root user"""
-        follower_ids = self.get_follower_ids(root_at_name)
-        followers = self.get_follower_objects(follower_ids)
-        return followers
-
-
-    def get_follower_ids(self, root_at_name):
-        """Get the follower IDs of the given root user"""
         try:
             root_user = self.api.GetUser(screen_name=root_at_name, include_entities=False)
         except twitter.error.TwitterError as e:
-            if error_message(e, "User not found."):
+            if error_message(e, USER_NOT_FOUND):
                 print("@{} is deleted".format(root_at_name))
-            elif error_message(e, "User has been suspended."):
+            elif error_message(e, SUSPENDED_ERROR):
                 print("@{} is suspended".format(root_at_name))
             else:
                 traceback.print_exc()
-            print("Exiting")
-            sys.exit() # TODO: some reasonable error handling here?
-        print("Getting {} followers of @{}".format(root_user.followers_count, root_user.screen_name))
+            #print("Exiting")
+            #sys.exit() # TODO: some reasonable error handling here?
+            return []
 
+        followers_count = root_user.followers_count
+
+        print("Getting {} followers of @{}".format(followers_count, root_user.screen_name))
+
+        followers = self.get_user_objects(self.get_follower_ids, (root_at_name, followers_count), followers_count)
+        return followers
+
+
+    def get_follower_ids(self, root_at_name, followers_count):
+        """Get the follower IDs of the given root user"""
         print("Getting follower IDs")
-        num_pages = int(math.ceil(float(root_user.followers_count)/5000))
+        num_pages = int(math.ceil(float(followers_count)/5000))
         follower_ids = self._get_ids_paged_ratelimited(num_pages, self.api.GetFollowerIDsPaged, {"screen_name":root_at_name}, "/followers/ids")
         return follower_ids
 
 
-    def get_follower_objects(self, follower_ids):
-        """Get the follower objects for the given follower ids"""
-        chunks = chunkify(follower_ids, 100)
+    def get_user_objects(self, user_ids_function, user_ids_function_args, user_count):
+        """Get the user objects for the user ids generated by user_ids_function"""
+        chunk_size = 100
+        num_chunks = math.ceil(user_count / chunk_size)
 
-        pool = multiprocessing.Pool(MAX_THREADS)
-        followers = []
-        results = []
+        pool = multiprocessing.pool.ThreadPool(MAX_THREADS)
+        #q = multiprocessing.Manager().Queue()
+        q = queue.Queue()
+
         start = time.time()
-        print("Getting follower objects")
+        print("Getting user objects")
         try:
-            for i,chunk in enumerate(chunks):
-                args = [i, len(chunks)]
-                kwargs = {"user_ids": chunk}
-                results.append(pool.apply_async(self._lookup_users_chunk, args, kwargs))
-            pool.close()
-            for r in results:
-                r.wait(999999999)
+            args = (user_ids_function, user_ids_function_args, chunk_size, num_chunks, pool, q)
+            spawner = threading.Thread(target=self._spawn_lookup_threads, name="_spawn_lookup_threads", args=args)
+            spawner.start()
         except KeyboardInterrupt:
             pool.terminate()
+            spawner.terminate()
             print()
             sys.exit()
         else:
+            n = 0
+            for i in range(num_chunks):
+                users = q.get()
+                for user in users:
+                    n += 1
+                    yield user
             pool.join()
+            spawner.join()
 
-        for r in results:
-            try:
-                followers += r.get()
-            except:
-                print("\n???")
-                raise
-
-        print("\nFollower objects gotten in %.2f seconds\n" % (time.time() - start))
-
-        return followers
+        print("\n{} user objects gotten in {:.2f} seconds\n".format(n, time.time() - start))
+        print(user_count)
 
 
-    def _lookup_users_chunk(self, i, num_chunks, user_ids=None, at_names=None):
+    def _spawn_lookup_threads(self, user_ids_function, user_ids_function_args, chunk_size, num_chunks, pool, q):
+        """A thread to spawn _lookup_users_chunk threads.
+        "Isn't that incredibly stupid?" you say. Yes, it is. But it's because
+        get_follower_ids (which get_followers passes in as user_ids_function
+        (via get_user_objects)) blocks, and we don't want get_user_objects to
+        block before we start extracting stuff from the queue.
+        """
+        try:
+            user_ids = user_ids_function(*user_ids_function_args)
+            for i in range(num_chunks):
+                chunk = list(itertools.islice(user_ids, chunk_size))
+                args = [q, i, num_chunks]
+                kwargs = {"user_ids": chunk}
+                pool.apply_async(self._lookup_users_chunk, args, kwargs)
+            pool.close()
+        except Exception as e:
+            traceback.print_exc()
+
+
+    def _lookup_users_chunk(self, q, i, num_chunks, user_ids=None, at_names=None):
         """Threadable function for looking up user objects"""
         cr()
         write_percentage(i, num_chunks, "chunk")
         sys.stdout.flush()
 
+        if not user_ids and not at_names:
+            print(" empty chunk", i) #DEBUG
+            q.put([]) # main thread keeps a count of how many it's processed, so we need this empty element
+            return
+
         while True:
             self._rate_limit("/users/lookup", i)
             threadname = multiprocessing.current_process().name
             try:
-                return [User(x) for x in self.api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)]
+                users = [User(x) for x in self.api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)]
+                q.put(users)
+                return
             except twitter.error.TwitterError as e:
                 if error_message(e, RLE) or error_message(e, OVER_CAPACITY) or error_message(e, INTERNAL_ERROR) or e.message == UNKNOWN_ERROR:
                     # ignore error entirely and retry
@@ -607,7 +691,7 @@ class BlockMachine:
             except requests.exceptions.ConnectionError as e:
                 fname = "error_logs/lookup_users_chunk-ConnectionError-%s-i%d.log" % (threadname, i)
                 with open(fname, "w") as f:
-                    print("[i=%d] ConnectionError logged to '%s'. Retrying in 10 seconds." % (i, fname))
+                    print("[{}] [i={}] ConnectionError logged to '{}'. Retrying in 10 seconds.".format(time_now(), i, fname))
                     traceback.print_exc(file=f)
                 time.sleep(10)
                 continue
@@ -646,13 +730,25 @@ class BlockMachine:
 
     def add_root_user(self, at_name, comment=None):
         """add a root user"""
-        already_exists = self.db.get_user_id(at_name) #FIXME: should look in root_users, not users for already_exists
         user = self.add_user(at_name)
         if user:
             self.db.add_root_user(user, comment)
             self.db.commit()
-        print("root user {}: {}".format("updated" if already_exists else "added", user))
+        print("root user: {}".format(user))
         return user
+
+
+    def load_root_users(self, fname=ROOT_USERS_FILE):
+        """load root users from file"""
+        with open(fname) as f:
+            for line in f:
+                line = line.strip()
+
+                if not line or line.startswith("#"):
+                    continue
+
+                at_name, comment = line.split(maxsplit=1)
+                self.add_root_user(at_name, comment)
 
 
     def update_root_user_followers(self, at_name):
@@ -660,19 +756,23 @@ class BlockMachine:
         root_user = self.add_root_user(at_name)
         if root_user:
             followers = self.get_followers(at_name)
-            followers_updated_at = time_now()
-            for follower in followers:
-                self.db.add_user(follower)
-                self.db.add_follow(root_user.id, follower.id, True, followers_updated_at)
-            self.db.set_root_user_followers_updated_at(root_user.id, followers_updated_at)
-            self.db.update_inactive_follows(root_user.id)
-            self.db.commit()
 
+            if followers:
+                followers_updated_at = time_now()
 
-    def update_all_root_user_followers(self):
-        """add the followers of all root users to the database"""
-        for at_name in reversed(self.db.get_root_users()):
-            self.update_root_user_followers(at_name)
+                for i,follower in enumerate(followers):
+                    self.db.add_user(follower)
+                    self.db.add_follow(root_user.id, follower.id, True, followers_updated_at)
+
+                    if i % 1000 == 0:
+                        #print(" commit", i) #DEBUG
+                        self.db.commit()
+
+                self.db.set_root_user_followers_updated_at(root_user.id, followers_updated_at)
+                self.db.update_inactive_follows(root_user.id)
+                self.db.commit()
+            else:
+                print("@{} has no followers".format(at_name))
 
 
 
@@ -723,10 +823,12 @@ def write_percentage(i, total, prefix=""):
 
 
 def module_repr(obj):
+    """the name of a module. for use in __repr__"""
     return (obj.__module__ + ".") if obj.__module__ != "__main__" else ""
 
 
 def cls_repr(obj):
+    """the name of a class. for use in __repr__"""
     return obj.__class__.__name__
 
 
@@ -803,88 +905,16 @@ def login(username, consumer_file=CONSUMER_FILE, sleep=True):
 
 
 def main():
-    api = login("BlockMachine_01")
+    api = login(sys.argv[1])
     db = DatabaseAccess()
     bm = BlockMachine(api, db)
 
-    if True:
-        bm.add_root_user("RichardBSpencer", "Nazi")
-        bm.add_root_user("DrDavidDuke",     "KKK")
-        bm.add_root_user("JamesADamore",    "Author of misogynistic Google memo")
-        bm.add_root_user("StefanMolyneux",  "Fascist")
-        bm.add_root_user("DineshDSouza",    "Fascist")
-        bm.add_root_user("stillgray",       "Fascist, and possibly the actual stupidest person on Twitter")
-        bm.add_root_user("Lauren_Southern", "Fascist")
-        bm.add_root_user("PrisonPlanet",    "Fascist")
-        bm.add_root_user("darrengrimes_",   "Criminal Brexit cheater")
-        bm.add_root_user("tomilahren",      "Fascist")
-        bm.add_root_user("DLoesch",         "Terrorist")
-        bm.add_root_user("Cernovich",       "Fascist")
+    #bm.load_root_users()
 
-        bm.add_root_user("BryanJFischer",   "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("DavidBartonWB",   "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("GDavidLane",      "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("garydemar",       "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("LouEngle",        "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("tperkins",        "SPLC-designated anti-LGBT extremist")
-        bm.add_root_user("AmericanFamAssc", "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("AFAAction",       "Lobbying arm of @AmericanFamAssc, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("AllianceDefends", "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("FRCdc",           "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("FRCAction",       "Lobbying arm of @FRCdc, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("libertycounsel",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("MatStaver",       "Founder of @libertycounsel, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("TVC_CapitolHill", "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("PeterLaBarbera",  "Founder of an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("AmericanVision",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("ATLAHWorldwide",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("DrJamesDManning", "Leader of @ATLAHWorldwide, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("FridayFax",       "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("austinruse",      "Leader of @FridayFax, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("RJRushdoony",     "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("sanderson1611",   "Leader of an SPLC-designated anti-LGBT")
-        bm.add_root_user("ProFamilyIFI",    "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("ILfamilyaction",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("MassResistance",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("PacificJustice",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("PublicFreedom",   "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("eugenedelgaudio", "Leader of @PublicFreedom, an SPLC-designated anti-LGBT")
-        bm.add_root_user("savecalifornia",  "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("UFI",             "SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("ProFam_Org",      "SPLC-designated anti-LGBT hate group")
+    #bm.update_root_user_followers(sys.argv[2])
 
-        bm.add_root_user("WBCSaysRepent",   "WBC, an SPLC-designated anti-LGBT hate group")
-        bm.add_root_user("WBCMediaContact", "WBC")
-        bm.add_root_user("PriestsRapeBoys", "WBC")
-        bm.add_root_user("SonsOfSamuel",    "WBC")
-        bm.add_root_user("WBCShirl2",       "WBC")
-        bm.add_root_user("GodHatesU",       "WBC")
-        bm.add_root_user("GodSmacksU",      "WBC")
-        bm.add_root_user("FagsDoomNations", "WBC")
-        bm.add_root_user("WBCBlogs",        "WBC")
-        bm.add_root_user("AbiWBC",          "WBC")
-        bm.add_root_user("WBCSermons",      "WBC")
-        bm.add_root_user("WBCLee",          "WBC")
-        bm.add_root_user("WBCVideo",        "WBC")
-        bm.add_root_user("WBCAudio",        "WBC")
-        bm.add_root_user("WBCsigns",        "WBC")
-        bm.add_root_user("WBCPhotos",       "WBC")
-        bm.add_root_user("WBCGran",         "WBC")
-        bm.add_root_user("WBCBecky",        "WBC")
-        bm.add_root_user("WBCpauletta",     "WBC")
-        bm.add_root_user("KJVMatt",         "WBC")
-        bm.add_root_user("GodHatesUK",      "WBC")
-        bm.add_root_user("WBCkat",          "WBC")
-        bm.add_root_user("VLPhelps",        "WBC")
-        bm.add_root_user("JabezPhelps",     "WBC")
-        bm.add_root_user("WBCLuci",         "WBC")
-        bm.add_root_user("WBCJon",          "WBC")
-        bm.add_root_user("Tachmonite",      "WBC")
-        bm.add_root_user("BettyWBC",        "WBC")
-        bm.add_root_user("WBCFredJr",       "WBC")
-
-    #bm.update_all_root_user_followers()
-    bm.update_root_user_followers("Lauren_Southern")
+    for at_name in bm.db.get_new_root_users():
+        bm.update_root_user_followers(at_name)
 
 
 if __name__ == "__main__":

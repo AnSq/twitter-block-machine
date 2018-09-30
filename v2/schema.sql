@@ -16,28 +16,24 @@ CREATE TABLE IF NOT EXISTS users (
     egg             BOOLEAN NOT NULL,
     created_at      TEXT    NOT NULL,
     lang            TEXT,
-    time_zone       TEXT,
-    utc_offset      INTEGER,
     last_tweet_time TEXT DEFAULT NULL,
     deleted         TEXT,
-    updated_at      TEXT,
-    UNIQUE (user_id, at_name)
+    updated_at      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS follows (
-    followee   TEXT    NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    follower   TEXT    NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    followee   TEXT    NOT NULL,
+    follower   TEXT    NOT NULL,
     active     BOOLEAN NOT NULL DEFAULT 1,
     checked_at TEXT,
     PRIMARY KEY (followee, follower)
 );
 
 CREATE TABLE IF NOT EXISTS root_users (
-    user_id              TEXT PRIMARY KEY,
+    user_id              TEXT PRIMARY KEY REFERENCES users(user_id) DEFERRABLE INITIALLY DEFERRED,
     at_name              TEXT NOT NULL,
     followers_updated_at TEXT DEFAULT NULL,
-    comment              TEXT DEFAULT NULL,
-    FOREIGN KEY (user_id, at_name) REFERENCES users(user_id, at_name) DEFERRABLE INITIALLY DEFERRED
+    comment              TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS whitelist (
@@ -50,3 +46,9 @@ SELECT *
 FROM users
 WHERE deleted NOT NULL
 ORDER BY deleted DESC;
+
+CREATE VIEW IF NOT EXISTS user_follows AS
+SELECT u0.user_id AS followee_id, u0.at_name AS followee, u1.at_name AS follower, u1.user_id AS follower_id
+FROM follows
+JOIN users AS u0 ON follows.followee=u0.user_id
+JOIN users AS u1 ON follows.follower=u1.user_id;
