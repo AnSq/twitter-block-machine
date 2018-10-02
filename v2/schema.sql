@@ -2,7 +2,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
     user_id         TEXT    PRIMARY KEY,
-    at_name         TEXT    NOT NULL UNIQUE,
+    at_name         TEXT    NOT NULL,
     display_name    TEXT    NOT NULL,
     tweets          INTEGER NOT NULL,
     following       INTEGER NOT NULL,
@@ -21,12 +21,21 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at      TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_users_at_name ON users(at_name);
+
 CREATE TABLE IF NOT EXISTS follows (
     followee   TEXT    NOT NULL,
     follower   TEXT    NOT NULL,
     active     BOOLEAN NOT NULL DEFAULT 1,
     checked_at TEXT,
     PRIMARY KEY (followee, follower)
+);
+
+CREATE TABLE IF NOT EXISTS blocks (
+    blocker    TEXT NOT NULL,
+    blocked    TEXT NOT NULL,
+    updated_at TEXT DEFAULT NULL,
+    PRIMARY KEY (blocker, blocked)
 );
 
 CREATE TABLE IF NOT EXISTS root_users (

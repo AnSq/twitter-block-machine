@@ -12,7 +12,6 @@ import threading
 import queue
 import traceback
 import itertools
-import collections
 import re
 
 import requests
@@ -217,6 +216,11 @@ class DatabaseAccess:
         pass #TODO
 
 
+    def add_block(self, blocker_id, blocked_id):
+        """Add a block relationship"""
+        self.cur.execute("INSERT OR IGNORE INTO blocks (blocker, blocked) VALUES (?,?);", [blocker_id, blocked_id])
+
+
     def get_atname_by_id(self, user_id):
         """get the at_name associated with a Twitter ID. Result will be None if the user is not in the database"""
         rs = self.cur.execute("SELECT at_name FROM users WHERE user_id==?;", [str(user_id)])
@@ -229,7 +233,7 @@ class DatabaseAccess:
 
     def get_user_id(self, at_name):
         """get the user_id of the user with the given at_name. Result will be None if the user is not in the database"""
-        rs = self.cur.execute("SELECT user_id FROM users WHERE at_name==? COLLATE NOCASE;", [at_name]) #FIXME: should COLLATE NOCASE be in the table def instead?
+        rs = self.cur.execute("SELECT user_id FROM users WHERE at_name==? COLLATE NOCASE;", [at_name])
         result = rs.fetchone()
         if result:
             return str(result[0])
@@ -458,8 +462,26 @@ class BlockMachine:
 
 
     def get_blocklist(self):
-        """return a list of user IDs that are blocked by the logged in user"""
+        """return a generator of user IDs that are blocked by the logged in user"""
         return self._get_ids_paged_ratelimited(None, self.api.GetBlocksIDsPaged, {}, "/blocks/ids")
+
+
+    def add_blocklist_to_database(self):
+        """Add block relationships for all of the logged in user's blocks to the database"""
+        blocker_id = self.logged_in_user.id
+
+        start_fetch = time.time()
+
+        for blocked_id in self.get_blocklist():
+            self.db.add_block(blocker_id, blocked_id)
+
+        print("time spent fetching: {}".format(time.time() - start_fetch))
+        start_commit = time.time()
+
+        self.db.commit()
+
+        print("time spent committing: {}".format(time.time() - start_commit))
+        print("total time: {}".format(time.time() - start_fetch))
 
 
     def clear_blocklist(self, blocklist=None):
@@ -626,7 +648,7 @@ class BlockMachine:
             sys.exit()
         else:
             n = 0
-            for i in range(num_chunks):
+            for _ in range(num_chunks):
                 users = q.get()
                 for user in users:
                     n += 1
@@ -653,7 +675,7 @@ class BlockMachine:
                 kwargs = {"user_ids": chunk}
                 pool.apply_async(self._lookup_users_chunk, args, kwargs)
             pool.close()
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
 
 
@@ -913,8 +935,10 @@ def main():
 
     #bm.update_root_user_followers(sys.argv[2])
 
-    for at_name in bm.db.get_new_root_users():
-        bm.update_root_user_followers(at_name)
+    #for at_name in bm.db.get_new_root_users():
+    #    bm.update_root_user_followers(at_name)
+
+    bm.add_blocklist_to_database()
 
 
 if __name__ == "__main__":
