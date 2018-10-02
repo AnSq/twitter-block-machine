@@ -3,6 +3,7 @@ env/
 get_access_token.py
 consumer.json
 *.token.json
+sqlite3
 *.sqlite
 *.sqlite-*
 *.pyc
