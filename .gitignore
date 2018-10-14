@@ -1,9 +1,13 @@
 env/
+error_logs/
+backups/
+python-twitter/
 .pylintrc
 get_access_token.py
 consumer.json
 *.token.json
 sqlite3
+libsqlite3.so
 *.sqlite
 *.sqlite-*
 *.pyc
@@ -20,5 +24,4 @@ sqlite3
 *.json
 *.csv
 whitelist.txt
-error_logs/
 !requirements.txt

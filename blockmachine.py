@@ -20,7 +20,7 @@ import twitter
 
 
 CONSUMER_FILE = "consumer.json"
-ROOT_USERS_FILE = "root_users.cfg"
+ROOT_USERS_FILE = "root_users.json"
 SQLITE_PCRE = "/usr/lib/sqlite3/pcre.so"
 
 REQUEST_TIMEOUT = 60
@@ -28,6 +28,8 @@ MAX_THREADS = 1
 DELETED = "deleted"
 SUSPENDED = "suspended"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+SLEEP_PADDING = 3
+COMMIT_EVERY = 25000
 
 # errors
 RLE = "Rate limit exceeded"
@@ -39,6 +41,30 @@ OVER_CAPACITY = "Over capacity"
 
 
 
+class Timer:
+    def __init__(self, name, oneline=False):
+        self.name = name
+        self.oneline = oneline
+        self.start = None
+
+
+    def __enter__(self):
+        if self.oneline:
+            print("{} ".format(self.name), end="", flush=True)
+        else:
+            print("start {}".format(self.name))
+        self.start = time.time()
+
+
+    def __exit__(self, *_):
+        elapsed = time.time() - self.start
+        if self.oneline:
+            print("({:.2f} s)".format(elapsed))
+        else:
+            print("end {} ({:.2f} s)".format(self.name, elapsed))
+
+
+
 class User:
     """Simple object for storing information about a user"""
 
@@ -47,17 +73,21 @@ class User:
         """replace Twitter URL entities in the given attribute of the given twitter.models.User
         object and returns the result"""
         s = user.__getattribute__(attr)
+
         try:
             for en in user._json["entities"][attr]["urls"]:
                 s = s.replace(en["url"], en["expanded_url"])
         except KeyError:
             pass
         finally:
-            return s.replace("http://", "").replace("https://", "") if s else s
+            return s.replace("http://", "").replace("https://", "") if s else s  #pylint: disable=lost-exception
 
 
-    def __init__(self, user):
+    def __init__(self, user=None):
         """Create a new User from the given twitter.models.User"""
+        if user is None:
+            return
+
         self.id              = user.id
         self.at_name         = user.screen_name
         self.display_name    = user.name
@@ -74,7 +104,35 @@ class User:
         self.created_at      = created_at(user.created_at)
         self.lang            = user.lang or None
         self.last_tweet_time = created_at(user.status.created_at) if user.status else None
+        self.deleted         = None
         self.updated_at      = time_now()
+
+
+    @classmethod
+    def from_tuple(cls, tup):
+        """Create a new user from a list of attributes"""
+        self = cls()
+
+        self.id              = tup[0]
+        self.at_name         = tup[1]
+        self.display_name    = tup[2]
+        self.tweets          = tup[3]
+        self.following       = tup[4]
+        self.followers       = tup[5]
+        self.likes           = tup[6]
+        self.verified        = tup[7]
+        self.protected       = tup[8]
+        self.bio             = tup[9]
+        self.location        = tup[10]
+        self.url             = tup[11]
+        self.egg             = tup[12]
+        self.created_at      = tup[13]
+        self.lang            = tup[14]
+        self.last_tweet_time = tup[15]
+        self.deleted         = tup[16]
+        self.updated_at      = tup[17]
+
+        return self
 
 
     def __repr__(self):
@@ -87,18 +145,23 @@ class DatabaseAccess:
 
     def __init__(self, fname="database.sqlite"):
         """Connect to the database, creating it if needed"""
+        print("sqlite version {}".format(sqlite3.sqlite_version))
+
         self.original_process = (multiprocessing.current_process().name, multiprocessing.current_process().ident)
 
         self.fname = fname
         self.conn = sqlite3.connect(self.fname)
         self.cur = self.conn.cursor()
 
-        #self.conn.create_function("REGEXP", 2, self._function_regexp)
+        #self.conn.create_function("REGEXP", 2, self._sql_function_regexp)
         self.conn.enable_load_extension(True)
         self.conn.load_extension(SQLITE_PCRE)
 
         with open("schema.sql") as f:
-            self.cur.executescript(f.read())
+            self.executescript(f.read())
+        self.commit()
+
+        self.execute("PRAGMA synchronous=NORMAL;")
         self.commit()
 
 
@@ -107,10 +170,28 @@ class DatabaseAccess:
 
 
     @staticmethod
-    def _function_regexp(pattern, string):
+    def _sql_function_regexp(pattern, string):
         if not string:
             return False
         return re.search(pattern, string, re.IGNORECASE) is not None
+
+
+    def _execute(self, func, func_params):
+        while True:
+            try:
+                return func(*func_params)
+            except sqlite3.OperationalError as e:
+                if e.args[0] == "database is locked":
+                    #print("locked") #DEBUG
+                    time.sleep(0.01)
+                else:
+                    raise e
+    def execute(self, *args):
+        return self._execute(self.cur.execute, args)
+    def executemany(self, *args):
+        return self._execute(self.cur.executemany, args)
+    def executescript(self, *args):
+        return self._execute(self.cur.executescript, args)
 
 
     def in_original_process(self):
@@ -130,18 +211,23 @@ class DatabaseAccess:
 
     def add_whitelist(self, user_id, at_name):
         """Add a user to the whitelist. DOES NOT unblock them."""
-        self.cur.execute("INSERT OR IGNORE INTO whitelist (user_id, at_name) VALUES (?, ?);", [user_id, at_name])
+        self.execute("INSERT OR IGNORE INTO whitelist (user_id, at_name) VALUES (?, ?);", [user_id, at_name])
 
 
     def clear_whitelist(self):
         """Clear the whitelist"""
-        self.cur.execute("DELETE FROM whitelist;")
+        self.execute("DELETE FROM whitelist;")
 
 
     def add_user(self, user):
-        """Add a user to the database, or updates them if they're already in it"""
+        """Add a user to the database, or update them if they're already in it"""
+        self.add_users([user])
 
-        data = {
+
+    def add_users(self, users):
+        """Add a list of users to the database, or update them if they're already in it"""
+
+        data = [{
             "user_id"         : str(user.id),
             "at_name"         : user.at_name,
             "display_name"    : user.display_name,
@@ -158,11 +244,11 @@ class DatabaseAccess:
             "created_at"      : user.created_at,
             "lang"            : user.lang,
             "last_tweet_time" : user.last_tweet_time,
-            "deleted"         : None,
+            "deleted"         : user.deleted,
             "updated_at"      : user.updated_at
-        }
+        } for user in users]
 
-        self.cur.execute("""
+        self.executemany("""
             UPDATE OR IGNORE users SET
             at_name=:at_name, display_name=:display_name, tweets=:tweets,
             following=:following, followers=:followers, likes=:likes,
@@ -175,7 +261,7 @@ class DatabaseAccess:
             data
         )
 
-        self.cur.execute ("""
+        self.executemany("""
             INSERT OR IGNORE INTO users
             (        user_id,  at_name,  display_name,  tweets,  following,  followers,  likes,  verified,  protected,  bio,  location,  url,  egg,  created_at,  lang,  last_tweet_time,  deleted,  updated_at)
             VALUES (:user_id, :at_name, :display_name, :tweets, :following, :followers, :likes, :verified, :protected, :bio, :location, :url, :egg, :created_at, :lang, :last_tweet_time, :deleted, :updated_at);
@@ -186,15 +272,20 @@ class DatabaseAccess:
 
     def add_follow(self, followee_id, follower_id, active, checked_at):
         """Add or update a follower relationship to the database"""
+        self.add_follows((followee_id, follower_id, active, checked_at))
 
-        data = {
-            "followee"   : followee_id,
-            "follower"   : follower_id,
-            "active"     : active,
-            "checked_at" : checked_at
-        }
 
-        self.cur.execute("""
+    def add_follows(self, follow_tuples):
+        """Add or update follower relationships to the database"""
+
+        data = [{
+            "followee"   : follow_tuple[0],
+            "follower"   : follow_tuple[1],
+            "active"     : follow_tuple[2],
+            "checked_at" : follow_tuple[3]
+        } for follow_tuple in follow_tuples]
+
+        self.executemany("""
             UPDATE OR IGNORE follows SET
             active=:active, checked_at=:checked_at
             WHERE followee=:followee AND follower=:follower;
@@ -202,7 +293,7 @@ class DatabaseAccess:
             data
         )
 
-        self.cur.execute("""
+        self.executemany("""
             INSERT OR IGNORE INTO follows
             (        followee,  follower,  active,  checked_at)
             VALUES (:followee, :follower, :active, :checked_at);
@@ -216,14 +307,20 @@ class DatabaseAccess:
         pass #TODO
 
 
-    def add_block(self, blocker_id, blocked_id):
+    def add_block(self, blocker_id, blocked_id, updated_at=None):
         """Add a block relationship"""
-        self.cur.execute("INSERT OR IGNORE INTO blocks (blocker, blocked) VALUES (?,?);", [blocker_id, blocked_id])
+        data = {
+            "blocker"    : blocker_id,
+            "blocked"    : blocked_id,
+            "updated_at" : updated_at
+        }
+        self.execute("UPDATE OR IGNORE blocks SET updated_at=:updated_at WHERE blocker=:blocker AND blocked=:blocked;", data)
+        self.execute("INSERT OR IGNORE INTO blocks (blocker, blocked, updated_at) VALUES (:blocker, :blocked, :updated_at);", data)
 
 
     def get_atname_by_id(self, user_id):
         """get the at_name associated with a Twitter ID. Result will be None if the user is not in the database"""
-        rs = self.cur.execute("SELECT at_name FROM users WHERE user_id==?;", [str(user_id)])
+        rs = self.execute("SELECT at_name FROM users WHERE user_id==?;", [str(user_id)])
         result = rs.fetchone()
         if result:
             return result[0]
@@ -233,7 +330,7 @@ class DatabaseAccess:
 
     def get_user_id(self, at_name):
         """get the user_id of the user with the given at_name. Result will be None if the user is not in the database"""
-        rs = self.cur.execute("SELECT user_id FROM users WHERE at_name==? COLLATE NOCASE;", [at_name])
+        rs = self.execute("SELECT user_id FROM users WHERE at_name==? COLLATE NOCASE LIMIT 1;", [at_name])
         result = rs.fetchone()
         if result:
             return str(result[0])
@@ -243,26 +340,27 @@ class DatabaseAccess:
 
     def get_whitelist(self):
         """return the entire whitelist as a list"""
-        rs = self.cur.execute("SELECT user_id FROM whitelist;")
+        rs = self.execute("SELECT user_id FROM whitelist;")
         return [int(x[0]) for x in rs.fetchall()]
 
 
     def set_user_deleted(self, user_id, deleted_status):
         """mark the given user as deleted or suspended"""
-        self.cur.execute("UPDATE users SET deleted=? WHERE user_id==?;", [deleted_status, str(user_id)])
+        self.execute("UPDATE users SET deleted=? WHERE user_id==?;", [deleted_status, str(user_id)])
 
 
-    def add_root_user(self, user, comment=None):
+    def add_root_user(self, user, comment=None, citation=None):
         """add a root user entry, or update a root user's comment"""
 
         data = {
-            "user_id" : user.id,
-            "at_name" : user.at_name,
-            "comment" : comment
+            "user_id"  : user.id,
+            "at_name"  : user.at_name,
+            "comment"  : comment,
+            "citation" : citation
         }
 
-        if comment is None:
-            self.cur.execute("""
+        if comment is None and citation is None:
+            self.execute("""
                 INSERT OR IGNORE INTO root_users
                 (        user_id,  at_name)
                 VALUES (:user_id, :at_name);
@@ -270,17 +368,17 @@ class DatabaseAccess:
                 data
             )
         else:
-            self.cur.execute("""
+            self.execute("""
                 INSERT OR IGNORE INTO root_users
-                (        user_id,  at_name,  comment)
-                VALUES (:user_id, :at_name, :comment);
+                (        user_id,  at_name,  comment,  citation)
+                VALUES (:user_id, :at_name, :comment, :citation);
                 """,
                 data
             )
 
-            self.cur.execute("""
+            self.execute("""
                 UPDATE OR IGNORE root_users
-                SET comment=:comment, at_name=:at_name
+                SET at_name=:at_name, comment=:comment, citation=:citation
                 WHERE user_id=:user_id;
                 """,
                 data
@@ -291,12 +389,18 @@ class DatabaseAccess:
         """update the followers_updated_at time for a root user"""
         if followers_updated_at is None:
             followers_updated_at = time_now()
-        self.cur.execute("UPDATE root_users SET followers_updated_at=? WHERE user_id=?", [followers_updated_at, user_id])
+        self.execute("UPDATE root_users SET followers_updated_at=? WHERE user_id=?", [followers_updated_at, user_id])
+
+
+    def get_root_users(self):
+        """get the at_name of all root users"""
+        rs = self.execute("SELECT at_name FROM root_users ORDER BY followers_updated_at;")
+        return [x[0] for x in rs.fetchall()]
 
 
     def get_new_root_users(self):
         """get the at_name of root users that have never been updated"""
-        rs = self.cur.execute("SELECT at_name FROM root_users WHERE followers_updated_at IS NULL;")
+        rs = self.execute("SELECT at_name FROM root_users_detail WHERE followers_updated_at IS NULL AND deleted IS NULL;")
         return [x[0] for x in rs.fetchall()]
 
 
@@ -314,7 +418,7 @@ class DatabaseAccess:
                     params.append(t)
         query += ";"
 
-        rs = self.cur.execute(query, params)
+        rs = self.execute(query, params)
         while True:
             chunk = rs.fetchmany(256)
             if not chunk:
@@ -323,19 +427,39 @@ class DatabaseAccess:
                 yield r[0]
 
 
-    def search_users_test(self, terms):
+    def _search_users_test(self, terms):
         fields = ["at_name", "display_name", "bio", "url"]
-        query = "SELECT user_id FROM users WHERE coalesce(lower({}),'') REGEXP ?"
+        query = "SELECT user_id FROM users WHERE coalesce(lower({}),'') REGEXP ?;"
         for t in terms:
             print()
             print('"{}",'.format(t), end="", flush=True)
             for i,field in enumerate(fields):
                 if terms[t][i]:
-                    rs = self.cur.execute(query.format(field), (t,))
-                    print("{},".format(len(rs.fetchall())), end="", flush=True)
+                    start_time = time.time()
+                    rs = self.execute(query.format(field), (t,))
+                    print("{},{:.2f},".format(len(rs.fetchall()), time.time()-start_time), end="", flush=True)
                 else:
-                    print(",", end="", flush=True)
+                    print(",,", end="", flush=True)
         print()
+
+
+    def _dump_some_users(self, fname, limit=1000, offset=1000000):
+        rs = self.execute("SELECT * FROM users LIMIT ? OFFSET ?", [limit, offset])
+        with open(fname, "w") as f:
+            json.dump(rs.fetchall(), f)
+
+
+    def _load_some_users(self, fname):
+        with open(fname) as f:
+            j = json.load(f)
+        users = [User.from_tuple(u) for u in j]
+
+        with Timer("insert"):
+            #for u in users:
+            #    self.add_user(u)
+            self.add_users(users)
+
+        self.rollback()
 
 
 
@@ -377,6 +501,7 @@ class BlockMachine:
                 else:
                     raise
 
+            #print("page {} returned {} ids".format(i+1, len(chunk))) #DEBUG
             for user_id in chunk:
                 yield user_id
 
@@ -392,12 +517,19 @@ class BlockMachine:
         limits (especially when multithreading), so it doesn't always work."""
         limit = self.api.rate_limit.get_limit(endpoint)
         if limit.remaining == 0:
-            sleep_for = limit.reset - time.time() + 5
+            sleep_for = limit.reset - time.time() + SLEEP_PADDING
             if sleep_for <= 0:
                 return
 
             print("\n[i=%d] Rate limit reached for %s. Sleeping for %.0f seconds (%.1f minutes. Until %s)" % (i, endpoint, sleep_for, sleep_for/60, time.strftime("%H:%M:%S", time.localtime(limit.reset+5))))
-            time.sleep(sleep_for)
+
+            while True:
+                # to handle paused processes (SIGSTOP/SIGTSTP), only sleep for a minute, then check again
+                time.sleep(min(sleep_for, 60))
+                sleep_for = limit.reset - time.time() + SLEEP_PADDING
+                if sleep_for <= 0:
+                    break
+
             print("Resuming")
 
 
@@ -436,7 +568,7 @@ class BlockMachine:
                 self.block(user)
             else:
                 self.unblock(user)
-        except Exception as e:
+        except Exception as e:  #pylint: disable=broad-except
             threadname = multiprocessing.current_process().name
             fname = "error_logs/block_unblock_wrapper-Exception-%s-i%d.log" % (threadname, i)
             with open(fname, "w") as f:
@@ -469,19 +601,28 @@ class BlockMachine:
     def add_blocklist_to_database(self):
         """Add block relationships for all of the logged in user's blocks to the database"""
         blocker_id = self.logged_in_user.id
+        updated_at = time_now()
 
-        start_fetch = time.time()
+        blocked_list = []
+        for i,blocked_id in enumerate(self.get_blocklist()):
+            blocked_list.append(blocked_id)
 
-        for blocked_id in self.get_blocklist():
-            self.db.add_block(blocker_id, blocked_id)
+            if i % COMMIT_EVERY == 0 and i != 0:
+                print(" {} ".format(i), end="", flush=True)
+                self._abtd_add_commit(blocked_list, blocker_id, updated_at)
 
-        print("time spent fetching: {}".format(time.time() - start_fetch))
-        start_commit = time.time()
+        self._abtd_add_commit(blocked_list, blocker_id, updated_at)
 
-        self.db.commit()
 
-        print("time spent committing: {}".format(time.time() - start_commit))
-        print("total time: {}".format(time.time() - start_fetch))
+    def _abtd_add_commit(self, blocked_list, blocker_id, updated_at):
+        with Timer("add blocks", True):
+            for bid in blocked_list:
+                self.db.add_block(blocker_id, bid, updated_at)
+
+        del blocked_list[:]
+
+        with Timer("commit", True):
+            self.db.commit()
 
 
     def clear_blocklist(self, blocklist=None):
@@ -614,7 +755,7 @@ class BlockMachine:
 
         print("Getting {} followers of @{}".format(followers_count, root_user.screen_name))
 
-        followers = self.get_user_objects(self.get_follower_ids, (root_at_name, followers_count), followers_count)
+        followers = self.get_user_objects_v2(self.get_follower_ids, (root_at_name, followers_count), followers_count)
         return followers
 
 
@@ -626,11 +767,84 @@ class BlockMachine:
         return follower_ids
 
 
+    def get_user_objects_v2(self, user_ids_function, user_ids_function_args, user_count):
+        """Get the user objects for the user ids generated by user_ids_function"""
+        chunk_size = 100
+        num_chunks = math.ceil(user_count / chunk_size)
+
+        user_ids = user_ids_function(*user_ids_function_args)
+
+        start = time.time()
+        print("Getting user objects")
+
+        stop = False
+        i = 0
+        n = 0
+        while True:
+            chunk = []
+            for _ in range(chunk_size):
+                try:
+                    chunk.append(next(user_ids))
+                except StopIteration:
+                    stop = True
+                    break
+            chunk_users = self._lookup_users_chunk_v2(i, num_chunks, user_ids=chunk)
+            for u in chunk_users:
+                n += 1
+                yield u
+
+            if stop:
+                break
+            stop = False
+            i += 1
+
+        print("\n{} user objects gotten in {:.2f} seconds".format(n, time.time() - start))
+        print(user_count)
+
+
+    def _lookup_users_chunk_v2(self, i, num_chunks, user_ids=None, at_names=None):
+        """function for looking up user objects"""
+        cr()
+        write_percentage(i, num_chunks, "chunk")
+        sys.stdout.flush()
+
+        if not user_ids and not at_names:
+            return []
+
+        while True:
+            self._rate_limit("/users/lookup", i)
+            threadname = multiprocessing.current_process().name
+            try:
+                users = [User(x) for x in self.api.UsersLookup(user_id=user_ids, screen_name=at_names, include_entities=False)]
+                return users
+            except twitter.error.TwitterError as e:
+                if error_message(e, RLE) or error_message(e, OVER_CAPACITY) or error_message(e, INTERNAL_ERROR) or e.message == UNKNOWN_ERROR:
+                    # ignore error entirely and retry
+                    continue
+                else:
+                    # log error and retry
+                    print("\n=== %s i=%d ==========" % (threadname, i))
+                    traceback.print_exc()
+                    print(e.message)
+                    print("===========================")
+                    with open("error_logs/lookup_users_chunk-TwitterError-%s-i%d.log" % (threadname, i), "w") as f:
+                        traceback.print_exc(file=f)
+                    continue
+            except requests.exceptions.ConnectionError as e:
+                fname = "error_logs/lookup_users_chunk-ConnectionError-%s-i%d.log" % (threadname, i)
+                with open(fname, "w") as f:
+                    print("[{}] [i={}] ConnectionError logged to '{}'. Retrying in 10 seconds.".format(time_now(), i, fname))
+                    traceback.print_exc(file=f)
+                time.sleep(10)
+                continue
+
+
     def get_user_objects(self, user_ids_function, user_ids_function_args, user_count):
         """Get the user objects for the user ids generated by user_ids_function"""
         chunk_size = 100
         num_chunks = math.ceil(user_count / chunk_size)
 
+        #pool = multiprocessing.Pool(MAX_THREADS)
         pool = multiprocessing.pool.ThreadPool(MAX_THREADS)
         #q = multiprocessing.Manager().Queue()
         q = queue.Queue()
@@ -640,13 +854,9 @@ class BlockMachine:
         try:
             args = (user_ids_function, user_ids_function_args, chunk_size, num_chunks, pool, q)
             spawner = threading.Thread(target=self._spawn_lookup_threads, name="_spawn_lookup_threads", args=args)
+            spawner.daemon = True
             spawner.start()
-        except KeyboardInterrupt:
-            pool.terminate()
-            spawner.terminate()
-            print()
-            sys.exit()
-        else:
+
             n = 0
             for _ in range(num_chunks):
                 users = q.get()
@@ -655,6 +865,11 @@ class BlockMachine:
                     yield user
             pool.join()
             spawner.join()
+        except KeyboardInterrupt:
+            pool.terminate()
+            #spawner.terminate()
+            print("{get_user_objects KeyboardInterrupt}")
+            sys.exit()
 
         print("\n{} user objects gotten in {:.2f} seconds\n".format(n, time.time() - start))
         print(user_count)
@@ -675,7 +890,7 @@ class BlockMachine:
                 kwargs = {"user_ids": chunk}
                 pool.apply_async(self._lookup_users_chunk, args, kwargs)
             pool.close()
-        except Exception:
+        except Exception:  #pylint: disable=broad-except
             traceback.print_exc()
 
 
@@ -719,9 +934,9 @@ class BlockMachine:
                 continue
 
 
-    def get_user(self, at_name):
+    def get_user(self, at_name=None, user_id=None):
         """get a single user. Will raise an error for deleted/suspended users"""
-        return User(self.api.GetUser(screen_name=at_name, include_entities=False))
+        return User(self.api.GetUser(screen_name=at_name, user_id=user_id, include_entities=False))
 
 
     def add_user(self, at_name):
@@ -747,14 +962,15 @@ class BlockMachine:
             self.db.add_user(user)
         finally:
             self.db.commit()
-            return user
+
+        return user
 
 
-    def add_root_user(self, at_name, comment=None):
+    def add_root_user(self, at_name, comment=None, citation=None):
         """add a root user"""
         user = self.add_user(at_name)
         if user:
-            self.db.add_root_user(user, comment)
+            self.db.add_root_user(user, comment, citation)
             self.db.commit()
         print("root user: {}".format(user))
         return user
@@ -763,14 +979,11 @@ class BlockMachine:
     def load_root_users(self, fname=ROOT_USERS_FILE):
         """load root users from file"""
         with open(fname) as f:
-            for line in f:
-                line = line.strip()
+            root_user_defs = json.load(f)
 
-                if not line or line.startswith("#"):
-                    continue
-
-                at_name, comment = line.split(maxsplit=1)
-                self.add_root_user(at_name, comment)
+        for root_user_def in root_user_defs:
+            at_name, comment, citation = root_user_def
+            self.add_root_user(at_name, comment, citation)
 
 
     def update_root_user_followers(self, at_name):
@@ -782,19 +995,39 @@ class BlockMachine:
             if followers:
                 followers_updated_at = time_now()
 
+                users = []
+                follows = []
                 for i,follower in enumerate(followers):
-                    self.db.add_user(follower)
-                    self.db.add_follow(root_user.id, follower.id, True, followers_updated_at)
+                    users.append(follower)
+                    follows.append((root_user.id, follower.id, True, followers_updated_at))
 
-                    if i % 1000 == 0:
-                        #print(" commit", i) #DEBUG
-                        self.db.commit()
+                    if i % COMMIT_EVERY == 0 and i != 0:
+                        print(" {} ".format(i), end="", flush=True)
+                        self._uruf_add_commit(users, follows)
 
+                self._uruf_add_commit(users, follows)
+
+                print("done getting users")
                 self.db.set_root_user_followers_updated_at(root_user.id, followers_updated_at)
                 self.db.update_inactive_follows(root_user.id)
+                print("committing")
                 self.db.commit()
+                print("done")
             else:
                 print("@{} has no followers".format(at_name))
+
+
+    def _uruf_add_commit(self, users, follows):
+        with Timer("add users", True):
+            self.db.add_users(users)
+        with Timer("add follows", True):
+            self.db.add_follows(follows)
+
+        del users[:]
+        del follows[:]
+
+        with Timer("commit", True):
+            self.db.commit()
 
 
 
@@ -933,12 +1166,17 @@ def main():
 
     #bm.load_root_users()
 
-    #bm.update_root_user_followers(sys.argv[2])
+    if len(sys.argv) >= 3:
+        bm.update_root_user_followers(sys.argv[2])
+    else:
+        while True:
+            new_root_users = bm.db.get_new_root_users()
+            if new_root_users:
+                bm.update_root_user_followers(new_root_users[0])
+            else:
+                break
 
-    #for at_name in bm.db.get_new_root_users():
-    #    bm.update_root_user_followers(at_name)
-
-    bm.add_blocklist_to_database()
+    #bm.add_blocklist_to_database()
 
 
 if __name__ == "__main__":

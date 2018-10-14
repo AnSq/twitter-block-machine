@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at      TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_users_at_name ON users(at_name);
+--CREATE INDEX IF NOT EXISTS idx_users_at_name ON users(at_name);
 
 CREATE TABLE IF NOT EXISTS follows (
     followee   TEXT    NOT NULL,
@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS root_users (
     user_id              TEXT PRIMARY KEY REFERENCES users(user_id) DEFERRABLE INITIALLY DEFERRED,
     at_name              TEXT NOT NULL,
     followers_updated_at TEXT DEFAULT NULL,
-    comment              TEXT DEFAULT NULL
+    comment              TEXT DEFAULT NULL,
+    citation             TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS whitelist (
@@ -61,3 +62,15 @@ SELECT u0.user_id AS followee_id, u0.at_name AS followee, u1.at_name AS follower
 FROM follows
 JOIN users AS u0 ON follows.followee=u0.user_id
 JOIN users AS u1 ON follows.follower=u1.user_id;
+
+CREATE VIEW IF NOT EXISTS root_users_detail AS
+SELECT users.user_id, users.at_name, followers_updated_at, comment, citation, display_name, tweets, following, followers, likes, verified, protected, bio, location, url, egg, created_at, lang, last_tweet_time, deleted, updated_at
+FROM root_users
+JOIN users ON root_users.user_id=users.user_id;
+
+CREATE VIEW IF NOT EXISTS max_rowid AS
+SELECT 'blocks' AS tbl,    coalesce(max(rowid),0) AS max_rowid FROM blocks
+UNION SELECT 'follows',    coalesce(max(rowid),0) FROM follows
+UNION SELECT 'root_users', coalesce(max(rowid),0) FROM root_users
+UNION SELECT 'users',      coalesce(max(rowid),0) FROM users
+UNION SELECT 'whitelist',  coalesce(max(rowid),0) FROM whitelist;
